@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""cc-restore — rebuild an iTerm2 window of `claude --resume` tabs after a restart.
+
+v2: primary source is ~/.claude/sessions/<PID>.json — Claude Code (>=2.1.x) writes
+one state file per live process ({pid, sessionId, cwd, kind, entrypoint, ...}) and
+removes it on clean exit. After a reboot (or crash / killed window), the files
+whose PID is dead are exactly the sessions that were alive, with authoritative
+sessionId + cwd. Live files give bulletproof dedup (covers bare `claude` sessions
+whose id is not in argv). Falls back to transcript-mtime clustering (v1 heuristic:
+live sessions heartbeat their transcript hourly) when no state files are usable.
+
+Usage:
+  cc-restore                 # restore all recently-dead sessions (state files, max-age 7d)
+  cc-restore --hours 12      # only sessions whose state file changed in the last 12h
+  cc-restore --max-age-days 3
+  cc-restore --legacy        # force the v1 transcript-mtime heuristic
+  cc-restore --dry-run       # print the plan, open nothing
+  cc-restore --limit 40      # safety cap on tabs (default 40)
+
+Run it soon after boot, ideally before starting new Claude work. Skips claude-mem
+observers (entrypoint sdk-cli), non-interactive sessions, sessions already running,
+and re-adds swept <repo>/.claude/worktrees/<name> worktrees from their parked
+worktree/<name> branch inside the tab itself.
+"""
+import argparse, json, os, subprocess, sys, time, glob
+
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+SESSIONS = os.path.join(CLAUDE_DIR, "sessions")
+PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+EXCLUDE = ("observer-sessions",)
+CLUSTER_GAP = 70 * 60  # legacy mode: transcript heartbeat is hourly
+
+
+def pid_is_claude(pid):
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        pass
+    try:
+        cmd = subprocess.check_output(["ps", "-o", "command=", "-p", str(pid)], text=True)
+    except subprocess.CalledProcessError:
+        return False
+    return "claude" in cmd
+
+
+def read_state_files():
+    live_ids, stale = set(), []
+    for fp in glob.glob(os.path.join(SESSIONS, "*.json")):
+        try:
+            o = json.load(open(fp))
+        except (OSError, ValueError):
+            continue
+        pid, sid = o.get("pid"), o.get("sessionId")
+        if not (isinstance(pid, int) and sid):
+            continue
+        if pid_is_claude(pid):
+            live_ids.add(sid)
+        else:
+            stale.append((os.path.getmtime(fp), o))
+    return live_ids, stale
+
+
+def running_resume_ids():
+    out = subprocess.check_output(["ps", "ax", "-o", "command"], text=True)
+    return {l.split("claude --resume ", 1)[1].split()[0]
+            for l in out.splitlines() if "claude --resume " in l}
+
+
+def first_user_snippet(sid):
+    for fp in glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl")):
+        try:
+            head = open(fp, "rb").read(300000).decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        for line in head:
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("type") == "user" and not o.get("isSidechain"):
+                c = o.get("message", {}).get("content")
+                if isinstance(c, str) and c.strip() and not c.startswith("<"):
+                    return " ".join(c.split())[:90]
+    return "(no transcript snippet)"
+
+
+def legacy_candidates(hours):
+    """v1: transcript-mtime clustering. Returns [(sid, cwd, snippet)]."""
+    now = time.time()
+    files = [f for f in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+             if not any(x in f for x in EXCLUDE) and os.path.getsize(f) > 5000]
+    if hours:
+        lo, hi = now - hours * 3600, now
+        print(f"legacy mode: transcripts active in last {hours:g}h")
+    else:
+        bt = int(subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
+                 .split("sec =")[1].split(",")[0])
+        pre = [os.path.getmtime(f) for f in files if os.path.getmtime(f) < bt]
+        if not pre:
+            sys.exit("legacy mode: no transcripts predate the last boot; try --hours N")
+        lo, hi = max(pre) - CLUSTER_GAP, bt
+        print(f"legacy mode: pre-boot transcript cluster "
+              f"{time.strftime('%m-%d %H:%M', time.localtime(lo))}..{time.strftime('%H:%M', time.localtime(max(pre)))}")
+    out = []
+    for f in sorted(files, key=os.path.getmtime):
+        if not (lo <= os.path.getmtime(f) <= hi):
+            continue
+        sid = os.path.basename(f)[:-6]
+        cwd, snippet = None, None
+        head = open(f, "rb").read(300000).decode("utf-8", "replace").splitlines()
+        for line in head:
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            cwd = cwd or o.get("cwd")
+            if snippet is None and o.get("type") == "user" and not o.get("isSidechain"):
+                c = o.get("message", {}).get("content")
+                if isinstance(c, str) and c.strip() and not c.startswith("<"):
+                    snippet = " ".join(c.split())[:90]
+        if cwd and snippet:
+            out.append((sid, cwd, snippet))
+    return out
+
+
+def tab_command(cwd, sid):
+    q = lambda s: "'" + s.replace("'", "'\\''") + "'"
+    if os.path.isdir(cwd):
+        return f"cd {q(cwd)} && claude --resume {sid}"
+    marker = "/.claude/worktrees/"
+    if marker in cwd:
+        repo, name = cwd.split(marker, 1)
+        name = name.split("/")[0]
+        if os.path.isdir(repo):
+            return (f"cd {q(repo)} && git worktree add {q('.claude/worktrees/' + name)} "
+                    f"{q('worktree/' + name)} ; cd {q(repo + marker + name)} && claude --resume {sid}")
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--hours", type=float, help="only sessions active in the last N hours")
+    ap.add_argument("--max-age-days", type=float, default=7.0,
+                    help="ignore state files older than this (default 7)")
+    ap.add_argument("--legacy", action="store_true", help="force v1 transcript-mtime heuristic")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--limit", type=int, default=40)
+    args = ap.parse_args()
+
+    now = time.time()
+    live_ids, stale = (set(), []) if args.legacy else read_state_files()
+    running = running_resume_ids() | live_ids
+    state_usable = bool(live_ids or stale)
+
+    plan, skipped = [], []
+    if not args.legacy and state_usable:
+        cutoff = now - (args.hours * 3600 if args.hours else args.max_age_days * 86400)
+        print(f"source: ~/.claude/sessions state files "
+              f"({len(live_ids)} live, {len(stale)} stale)")
+        seen = set()
+        for mtime, o in sorted(stale):
+            sid, cwd = o["sessionId"], o.get("cwd", "")
+            if sid in seen:
+                continue
+            seen.add(sid)
+            if mtime < cutoff:
+                continue
+            if o.get("kind") != "interactive" or o.get("entrypoint") != "cli":
+                skipped.append((sid, f"not an interactive CLI session ({o.get('entrypoint')})"))
+                continue
+            if sid in running:
+                skipped.append((sid, "already running"))
+                continue
+            cmd = tab_command(cwd, sid)
+            if cmd is None:
+                skipped.append((sid, f"cwd gone, not restorable: {cwd}"))
+                continue
+            plan.append((sid, cwd, first_user_snippet(sid), cmd))
+    else:
+        if not args.legacy:
+            print("no usable state files in ~/.claude/sessions — falling back to legacy heuristic")
+        for sid, cwd, snippet in legacy_candidates(args.hours):
+            if sid in running:
+                skipped.append((sid, "already running"))
+                continue
+            cmd = tab_command(cwd, sid)
+            if cmd is None:
+                skipped.append((sid, f"cwd gone, not restorable: {cwd}"))
+                continue
+            plan.append((sid, cwd, snippet, cmd))
+
+    for sid, reason in skipped:
+        print(f"  skip {sid[:8]}: {reason}")
+    if not plan:
+        sys.exit("nothing to restore.")
+    if len(plan) > args.limit:
+        sys.exit(f"{len(plan)} sessions exceeds --limit {args.limit}; raise it if intentional.")
+    for sid, cwd, snippet, _ in plan:
+        print(f"  open {sid[:8]}  {cwd}\n       \"{snippet}\"")
+    if args.dry_run:
+        print(f"dry-run: would open {len(plan)} tabs.")
+        return
+
+    lines = ['tell application "iTerm2"', "activate",
+             "set w to (create window with default profile)", "set first_done to false"]
+    for _, _, _, cmd in plan:
+        esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
+        lines += ["if first_done then",
+                  "tell w to set t to (create tab with default profile)",
+                  f'tell current session of t to write text "{esc}"',
+                  "else",
+                  f'tell current session of w to write text "{esc}"',
+                  "set first_done to true",
+                  "end if",
+                  "delay 0.4"]
+    lines += ["end tell"]
+    subprocess.run(["osascript", *sum((["-e", l] for l in lines), [])], check=True)
+    print(f"opened {len(plan)} tabs.")
+
+
+if __name__ == "__main__":
+    main()
