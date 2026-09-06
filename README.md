@@ -44,10 +44,45 @@ cc-restore --dry-run      # print the plan, open nothing
 cc-restore --hours 12     # only sessions active in the last 12 hours
 cc-restore --max-age-days 3
 cc-restore --legacy       # force the transcript-mtime heuristic
+cc-restore --auto         # boot-gated mode for launchd, see below
 cc-restore --limit 40     # safety cap on tabs (default 40)
 ```
 
-Run it soon after boot, ideally before starting new Claude work.
+Run it soon after boot, ideally before starting new Claude work. Or make it automatic:
+
+## Automatic restore at login (Chrome-style)
+
+iTerm2's own restoration brings back windows and scrollback after a reboot but can never revive processes, so the Chrome-like experience is a login agent that runs `cc-restore --auto`:
+
+```xml
+<!-- ~/Library/LaunchAgents/com.yourname.cc-restore.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.yourname.cc-restore</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>sleep 10; exec /Users/YOU/.local/bin/cc-restore --auto</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/YOU/Library/Logs/cc-restore.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOU/Library/Logs/cc-restore.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yourname.cc-restore.plist
+```
+
+`--auto` is designed for exactly this: it only restores sessions that were killed by the shutdown or a crash (state files predating the current boot), never tabs you closed on purpose (clean exits delete their state file, and anything that died after boot is skipped), it runs at most once per boot (marker in `~/.cache/cc-restore.bootmark`), and it exits quietly when there is nothing to do. The first restore after a reboot may show one macOS dialog asking to allow control of iTerm2; approve it once.
 
 ## Bonus: always resume with the full transcript
 

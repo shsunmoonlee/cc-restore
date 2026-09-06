@@ -142,12 +142,34 @@ def tab_command(cwd, sid):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=float, help="only sessions active in the last N hours")
-    ap.add_argument("--max-age-days", type=float, default=7.0,
-                    help="ignore state files older than this (default 7)")
+    ap.add_argument("--max-age-days", type=float, default=None,
+                    help="ignore state files older than this (default 7; 30 with --auto)")
     ap.add_argument("--legacy", action="store_true", help="force v1 transcript-mtime heuristic")
+    ap.add_argument("--auto", action="store_true",
+                    help="boot-gated mode for launchd: restore only sessions killed by the "
+                         "shutdown/crash, at most once per boot, quiet when there is nothing to do")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int, default=40)
     args = ap.parse_args()
+    max_age_days = args.max_age_days if args.max_age_days is not None else (30.0 if args.auto else 7.0)
+
+    boot = mark = None
+    if args.auto:
+        boot = int(subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
+                   .split("sec =")[1].split(",")[0])
+        mark = os.path.expanduser("~/.cache/cc-restore.bootmark")
+        if not args.dry_run:
+            try:
+                if open(mark).read().strip() == str(boot):
+                    print("auto: already restored for this boot")
+                    return
+            except OSError:
+                pass
+
+    def write_mark():
+        if args.auto and not args.dry_run:
+            os.makedirs(os.path.dirname(mark), exist_ok=True)
+            open(mark, "w").write(str(boot))
 
     now = time.time()
     live_ids, stale = (set(), []) if args.legacy else read_state_files()
@@ -156,7 +178,7 @@ def main():
 
     plan, skipped = [], []
     if not args.legacy and state_usable:
-        cutoff = now - (args.hours * 3600 if args.hours else args.max_age_days * 86400)
+        cutoff = now - (args.hours * 3600 if args.hours else max_age_days * 86400)
         print(f"source: ~/.claude/sessions state files "
               f"({len(live_ids)} live, {len(stale)} stale)")
         seen = set()
@@ -166,6 +188,9 @@ def main():
                 continue
             seen.add(sid)
             if mtime < cutoff:
+                continue
+            if args.auto and mtime >= boot:
+                skipped.append((sid, "died after boot (closed deliberately), not auto-restoring"))
                 continue
             if o.get("kind") != "interactive" or o.get("entrypoint") != "cli":
                 skipped.append((sid, f"not an interactive CLI session ({o.get('entrypoint')})"))
@@ -194,6 +219,10 @@ def main():
     for sid, reason in skipped:
         print(f"  skip {sid[:8]}: {reason}")
     if not plan:
+        write_mark()
+        if args.auto:
+            print("nothing to restore.")
+            return
         sys.exit("nothing to restore.")
     if len(plan) > args.limit:
         sys.exit(f"{len(plan)} sessions exceeds --limit {args.limit}; raise it if intentional.")
@@ -217,6 +246,7 @@ def main():
                   "delay 0.4"]
     lines += ["end tell"]
     subprocess.run(["osascript", *sum((["-e", l] for l in lines), [])], check=True)
+    write_mark()
     print(f"opened {len(plan)} tabs.")
 
 
