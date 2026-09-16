@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""cc-tabwatch — click a hibernated iTerm2 tab, its Claude session resumes itself.
+
+Connects to iTerm2's Python API and watches which session is focused. When you focus
+a tab whose tty appears (unwoken) in a cc-hibernate manifest, and that tab is sitting
+at a bare shell, it types `cd <cwd> && claude --resume <id>` and hits return, then
+marks the entry woken. Full transcript, same tab, no fork.
+
+Guards: only acts on a focused session, only once per tty per 20s, only when the
+session id is not already running, and only when free RAM is above --min-free-pct
+(otherwise it prints a note in the tab instead of thrashing swap).
+
+Started by cc-daemon, or on its own from a LaunchAgent whose label is yours to pick
+(for example com.shsunmoonlee.cc-tabwatch); log ~/Library/Logs/cc-tabwatch.log.
+"""
+import asyncio, glob, json, os, subprocess, sys, time
+from pathlib import Path
+
+# `iterm2` is a pip package, not stdlib, and the interpreter that has it is often a venv.
+# If this interpreter cannot import it, re-exec into one that can: the conventional
+# ~/.claude/venvs/iterm2/bin/python, else $CC_ITERM2_PYTHON. CC_TABWATCH_REEXEC marks the
+# attempt so a replacement interpreter that also lacks iterm2 cannot loop forever.
+try:
+    import iterm2
+except ImportError:
+    if os.environ.get("CC_TABWATCH_REEXEC"):
+        sys.exit("cc-tabwatch: the `iterm2` package is missing from "
+                 f"{sys.executable}. `pip install iterm2`, or point CC_ITERM2_PYTHON at an "
+                 "interpreter that already has it.")
+    _here = os.path.realpath(sys.executable)
+    for _py in (str(Path.home() / ".claude" / "venvs" / "iterm2" / "bin" / "python"),
+                os.environ.get("CC_ITERM2_PYTHON")):
+        if not _py or not os.access(_py, os.X_OK) or os.path.realpath(_py) == _here:
+            continue
+        os.environ["CC_TABWATCH_REEXEC"] = "1"
+        try:
+            os.execv(_py, [_py, os.path.abspath(__file__), *sys.argv[1:]])
+        except OSError:
+            continue
+    sys.exit("cc-tabwatch: the `iterm2` package is missing and no interpreter with it was "
+             "found. `pip install iterm2` for this python, or set CC_ITERM2_PYTHON to an "
+             "interpreter that has it (e.g. ~/.claude/venvs/iterm2/bin/python).")
+
+HOME = Path.home()
+STATE = HOME / ".claude" / "state" / "hibernate"
+SESS = HOME / ".claude" / "sessions"
+MIN_FREE_PCT = int(os.environ.get("CC_TABWATCH_MIN_FREE", "18"))
+last_fire = {}
+
+
+def log(msg):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0); return True
+    except OSError:
+        return False
+
+
+def running_ids():
+    out = set()
+    for f in SESS.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        if d.get("pid") and alive(d["pid"]):
+            out.add(d.get("sessionId"))
+    return out
+
+
+def free_pct():
+    try:
+        o = subprocess.run(["memory_pressure"], capture_output=True, text=True, timeout=10).stdout
+        for line in o.splitlines():
+            if "free percentage" in line:
+                return int(line.rsplit(":", 1)[1].strip().rstrip("%"))
+    except Exception:
+        pass
+    return -1
+
+def resume_dir(cwd):
+    """Directory to resume in. A deleted `<repo>/.claude/worktrees/<name>` falls back to
+    <repo> (Claude Code removes a worktree once its branch is merged and the tree is
+    clean); anything else falls back to the nearest existing ancestor."""
+    p = Path(cwd)
+    if p.is_dir():
+        return str(p), False
+    parts = p.parts
+    if len(parts) >= 4 and parts[-3:-1] == (".claude", "worktrees"):
+        repo = Path(*parts[:-3])
+        if repo.is_dir():
+            return str(repo), True
+    while not p.is_dir() and p != p.parent:
+        p = p.parent
+    return str(p), True
+
+
+def find_entry(tty):
+    """Newest unwoken manifest entry for this tty."""
+    best = None
+    for p in sorted(glob.glob(str(STATE / "manifest-*.json"))):
+        try:
+            m = json.loads(Path(p).read_text())
+        except Exception:
+            continue
+        for e in m["entries"]:
+            if e.get("tty") == tty and not e.get("woken"):
+                best = (Path(p), m, e)
+    return best
+
+
+def mark_woken(path, m, e):
+    e["woken"] = True
+    e["wokenAt"] = time.strftime("%Y%m%d-%H%M%S")
+    e["wokenBy"] = "tabwatch"
+    path.write_text(json.dumps(m, indent=1))
+
+
+async def handle(session):
+    if session is None:
+        return
+    tty = (await session.async_get_variable("tty") or "").replace("/dev/", "")
+    if not tty.startswith("ttys"):
+        return
+    now = time.time()
+    if now - last_fire.get(tty, 0) < 20:
+        return
+    hit = find_entry(tty)
+    if not hit:
+        return
+    path, m, e = hit
+    if not e.get("itermId") and e.get("killedAt", "") < time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - 86400)):
+        log(f"{tty} ignored: entry older than a day has no tab GUID; use cc-wake --only {e['sessionId'][:8]}")
+        last_fire[tty] = now; return
+    if e.get("itermId") and e["itermId"] != session.session_id:
+        log(f"{tty} ignored: tab GUID changed (tty reused by a new tab); use cc-wake --only {e['sessionId'][:8]}")
+        last_fire[tty] = now; return
+    if e["sessionId"] in running_ids():
+        mark_woken(path, m, e); return
+    jobname = (await session.async_get_variable("jobName")) or ""
+    if jobname not in ("zsh", "-zsh", "bash", "-bash", "sh", "login", ""):
+        return  # something is already running in this tab
+    last_fire[tty] = now
+    fp = free_pct()
+    if fp >= 0 and fp < MIN_FREE_PCT:
+        await session.async_send_text(f"\x15print -r -- 'cc-tabwatch: only {fp}% RAM free; hibernate something, then press Enter'\n")
+        log(f"{tty} deferred, free {fp}%"); return
+    cwd, fell_back = resume_dir(e["cwd"])
+    if fell_back:
+        await session.async_send_text(f"\x15print -r -- 'cc-tabwatch: {e['cwd']} is gone; resuming in {cwd}'\n")
+        log(f"{tty} cwd missing {e['cwd']} -> {cwd}")
+    await session.async_send_text(f"\x15cd {cwd} && claude --resume {e['sessionId']}\n")
+    await session.async_set_name(e.get("title") or e.get("name") or "claude")
+    mark_woken(path, m, e)
+    log(f"{tty} resumed {e['sessionId'][:8]} ({e.get('title','')[:40]}) free={fp}%")
+
+
+async def main(connection):
+    app = await iterm2.async_get_app(connection)
+    log(f"watching (min free {MIN_FREE_PCT}%)")
+    await handle(app.current_terminal_window and app.current_terminal_window.current_tab and
+                 app.current_terminal_window.current_tab.current_session)
+    async with iterm2.FocusMonitor(connection) as mon:
+        while True:
+            update = await mon.async_get_next_update()
+            sid = None
+            if update.selected_tab_changed:
+                sid = update.selected_tab_changed.tab_id
+                tab = app.get_tab_by_id(sid)
+                await handle(tab.current_session if tab else None)
+            elif update.active_session_changed:
+                s = app.get_session_by_id(update.active_session_changed.session_id)
+                await handle(s)
+            elif update.window_changed and update.window_changed.event == iterm2.FocusUpdateWindowChanged.Reason.TERMINAL_WINDOW_BECAME_KEY:
+                w = app.get_window_by_id(update.window_changed.window_id)
+                if w and w.current_tab:
+                    await handle(w.current_tab.current_session)
+
+
+if not os.environ.get("ITERM2_COOKIE"):
+    # scripts launched outside iTerm2 need a one-shot cookie; iTerm2 hands one to any
+    # AppleScript caller it trusts (iTerm2 -> Automation grant is already in place).
+    r = subprocess.run(["osascript", "-e", 'tell application "iTerm2" to request cookie'],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or not r.stdout.strip():
+        log(f"could not get an API cookie from iTerm2: {r.stderr.strip()[:120]}")
+        sys.exit(1)
+    os.environ["ITERM2_COOKIE"] = r.stdout.strip()
+try:
+    iterm2.run_forever(main)
+except Exception as exc:
+    log(f"fatal: {exc}")
+    sys.exit(1)

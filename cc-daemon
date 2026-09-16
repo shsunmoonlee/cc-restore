@@ -1,0 +1,36 @@
+#!/bin/zsh
+# cc-daemon — supervisor for Claude Code session memory management. Must be started
+# from a shell INSIDE iTerm2 (so osascript/iTerm2-API calls inherit iTerm2's macOS
+# Automation grants; launchd-spawned copies hang on TCC). ~/.zshrc starts it on the
+# first iTerm2 shell after login if it is not already running.
+#   - every 120s: cc-hibernate --terminal iterm2 --idle-minutes 5 --idle-only --skip-visible
+#   - keeps cc-tabwatch (resume-on-tab-focus) alive
+# Log: ~/Library/Logs/cc-daemon.log   Stop: cc-daemon stop
+STATE=$HOME/.claude/state; PID=$STATE/cc-daemon.pid; TW=$STATE/cc-tabwatch.pid; LOG=$HOME/Library/Logs/cc-daemon.log
+tw_alive() { [[ -f $TW ]] && kill -0 "$(cat $TW)" 2>/dev/null; }
+mkdir -p "$STATE"
+if [[ "$1" == "stop" ]]; then
+  [[ -f $PID ]] && kill "$(cat $PID)" 2>/dev/null && rm -f "$PID" && echo "cc-daemon stopped"
+  tw_alive && kill "$(cat $TW)" 2>/dev/null; rm -f "$TW"; exit 0
+fi
+if [[ "$1" == "status" ]]; then
+  if [[ -f $PID ]] && kill -0 "$(cat $PID)" 2>/dev/null; then echo "cc-daemon running (pid $(cat $PID))"; else echo "cc-daemon not running"; fi
+  tw_alive && echo "cc-tabwatch running (pid $(cat $TW))" || echo "cc-tabwatch not running"; exit 0
+fi
+if [[ -f $PID ]] && kill -0 "$(cat $PID)" 2>/dev/null; then exit 0; fi   # already running
+if [[ "$1" != "--foreground" ]]; then
+  nohup "$0" --foreground >>"$LOG" 2>&1 &!
+  exit 0
+fi
+echo $$ > "$PID"
+echo "$(date '+%F %T') cc-daemon start pid $$ (TERM_PROGRAM=${TERM_PROGRAM:-?})"
+IDLE_MIN=${CC_IDLE_MINUTES:-5}
+while true; do
+  if ! tw_alive; then
+    "$HOME/.claude/venvs/iterm2/bin/python" "$HOME/.claude/bin/cc-tabwatch" >>"$HOME/Library/Logs/cc-tabwatch.log" 2>&1 &!
+    echo $! > "$TW"
+    echo "$(date '+%F %T') started cc-tabwatch"
+  fi
+  /usr/bin/python3 "$HOME/.claude/bin/cc-hibernate" --terminal iterm2 --idle-minutes "$IDLE_MIN" --idle-only --skip-visible --quiet >>"$HOME/Library/Logs/cc-hibernate.log" 2>&1
+  sleep 120
+done

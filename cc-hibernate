@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""cc-hibernate — free RAM by ending idle Claude Code sessions, resumably.
+
+Think of it as slot management: a live session costs ~600MB (node + MCP helpers)
+whether or not it is doing anything. This SIGKILLs idle interactive CLI sessions,
+records a manifest, leaves a banner + "[hibernated]" title in the tab, and
+`cc-wake` resumes them (full transcript) in the same tab.
+
+SIGKILL is deliberate: a graceful exit runs SessionEnd hooks, deletes the
+~/.claude/sessions/<pid>.json state file cc-restore relies on, and on a clean
+worktree session may remove the worktree. SIGKILL leaves transcript, worktree and
+state file untouched (verified 2026-09-06). Terminal modes Claude Code left on
+(mouse reporting, kitty keyboard, bracketed paste) are reset on the tty afterwards.
+
+"Idle" is the registry status AND no child process AND no file writes AND (since
+2026-09-13) nothing the session will still do on its own: no undelivered queued input
+and no usage-limit wait (Claude Code's "Continue automatically at usage limit" parks
+the process as registry-idle until the reset, then continues the task). See pending_work().
+
+  cc-hibernate --dry-run
+  cc-hibernate --terminal iterm2 --idle-minutes 5 --idle-only --skip-visible   # what the LaunchAgent runs
+  cc-hibernate --except <sid>[,<sid>]
+  cc-hibernate --include-busy            # also busy/shell sessions (not recommended)
+Manifests: ~/.claude/state/hibernate/manifest-<ts>.json (+ latest.json).
+"""
+import argparse, calendar, glob, json, os, re, signal, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+SESS = HOME / ".claude" / "sessions"
+STATE = HOME / ".claude" / "state" / "hibernate"
+TTY_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
+             "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[<u\x1b[?7h\x1b[0m\x1b>")
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def ps_table():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,tty=,command="], capture_output=True, text=True).stdout
+    t = {}
+    for line in out.splitlines():
+        p = line.split(None, 3)
+        if len(p) >= 3:
+            t[int(p[0])] = (int(p[1]), p[2], p[3] if len(p) > 3 else "")
+    return t
+
+
+def terminal_of(pid, table):
+    seen = 0
+    while pid in table and seen < 20:
+        ppid, _, cmd = table[pid]
+        low = cmd.lower()
+        if "iterm2" in low or "iterm.app" in low:
+            return "iterm2"
+        if "cmux.app" in low or low.endswith("/cmux"):
+            return "cmux"
+        if "terminal.app" in low:
+            return "terminal"
+        if "ghostty" in low:
+            return "ghostty"
+        pid, seen = ppid, seen + 1
+    return "unknown"
+
+
+# Children every session always has (MCP servers from ~/.claude.json + plugins). Anything
+# else under the claude pid — a `zsh -c source .../shell-snapshots/...` (a Bash tool call,
+# foreground OR background task) or `caffeinate` (Claude's own busy marker) — means the
+# session is working even though the registry may still say "idle".
+HELPER_PATTERNS = ("adrafinil mcp", "npm exec ", "node -e const f=require('fs')", "mcp-server", "/.bin/", "-mcp")
+
+
+def working_children(pid, table):
+    out = []
+    for cpid, (ppid, _, cmd) in table.items():
+        if ppid != pid:
+            continue
+        if any(h in cmd for h in HELPER_PATTERNS):
+            continue
+        out.append("shell task" if "shell-snapshots" in cmd or cmd.startswith(("/bin/zsh", "/bin/bash", "zsh", "bash")) else cmd.split()[0].rsplit("/", 1)[-1])
+    return out
+
+
+def activity_ms(sid):
+    """Newest write (ms) by this session outside the registry: its transcript, its
+    subagent transcripts, and its background-task / Monitor output files. Covers work
+    that has no child process: Agent/Workflow subagents, Monitor(ws), /loop wakeups."""
+    newest = 0.0
+    paths = []
+    for p in glob.glob(str(HOME / ".claude" / "projects" / "*" / f"{sid}.jsonl")):
+        paths.append(p); paths += glob.glob(p[:-6] + "/subagents/*.jsonl")
+    paths += glob.glob(f"/private/tmp/claude-{os.getuid()}/*/{sid}/tasks/*")
+    for p in paths:
+        try:
+            newest = max(newest, os.path.getmtime(p))
+        except OSError:
+            continue  # vanished mid-scan
+    return newest * 1000
+
+
+def has_transcript(sid):
+    """Claude Code writes <sid>.jsonl only after the first message; a session killed
+    before that has nothing to resume (`claude --resume` says "No conversation found")."""
+    return bool(glob.glob(str(HOME / ".claude" / "projects" / "*" / f"{sid}.jsonl")))
+
+
+TAIL_BYTES = 2_000_000          # transcripts reach hundreds of MB; only the tail matters and this runs every 120 s
+LIMIT_GRACE_MS = 15 * 60e3      # after resetsAt: time for the auto-continue to fire and the registry to flip busy
+QUEUED_MAX_AGE_MS = 24 * 3600e3 # undelivered queued input keeps a session alive at most this long
+
+
+def transcript_tail(sid):
+    """Raw lines from the tail of the session's transcript (partial first line dropped)."""
+    for f in (HOME / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(0, 2); size = fh.tell(); fh.seek(max(0, size - TAIL_BYTES))
+                if size > TAIL_BYTES:
+                    fh.readline()
+                return fh.readlines()
+        except OSError:
+            continue
+    return []
+
+
+def pending_work(lines):
+    """Work a registry-"idle" session will still do on its own, read from its transcript tail.
+
+    queued: input that arrived while the session could not run and was never delivered —
+      task notifications, Monitor events, a typed message. `queue-operation` lines log
+      enqueue / dequeue (a dequeue drains the queue into the next turn) / remove (one item).
+      SIGKILL drops the queue: 2026-09-12 a Monitor result and a background-task result
+      queued 7 s after a 429 were gone after the resume (the user had to type "continue").
+    limit_resets_at: the last message is a usage-limit 429 (`isApiErrorMessage`,
+      error=rate_limit, quotaLimits.resetsAt). Claude Code's "Continue automatically at
+      usage limit" then keeps the process waiting and fires the continuation at the reset,
+      but the registry reads "idle" for the whole wait, so the 5-minute idle rule killed the
+      "Pricing strategy" session mid-task on 09-11 and 09-12. Killing during the wait =
+      "Claude Code exited during the wait, so the task will not resume on its own".
+    """
+    queued, limit = [], 0
+    for raw in lines:
+        if b'"type":"queue-operation"' in raw:
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            op = d.get("operation")
+            if op == "enqueue":
+                queued.append(d.get("timestamp") or "")
+            elif op == "dequeue":
+                queued.clear()
+            elif op == "remove" and queued:
+                queued.pop(0)
+            continue
+        if b'"isApiErrorMessage":true' in raw and b'"rate_limit"' in raw:
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            q = d.get("quotaLimits") or {}
+            if d.get("error") == "rate_limit" and q.get("status") == "rejected" and q.get("resetsAt"):
+                limit = float(q["resetsAt"]) * 1000
+                continue
+        if b'"type":"user"' in raw[:600] or b'"type":"assistant"' in raw[:600]:
+            # the conversation moved on: past the 429, and past the queue (live queued items
+            # are dequeued before the next turn; a queue with no dequeue before a later
+            # message belonged to a process that is gone, e.g. before a --resume)
+            limit = 0
+            queued.clear()
+    newest = 0.0
+    for ts in queued:  # transcript timestamps are UTC ISO-8601
+        try:
+            newest = max(newest, calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) * 1000)
+        except Exception:
+            continue
+    return {"queued": len(queued), "queued_at": newest, "limit_resets_at": limit}
+
+
+def cwd_map():
+    """pid -> cwd for this user's processes (one lsof call)."""
+    m, pid = {}, None
+    try:
+        out = subprocess.run(["lsof", "-n", "-a", "-d", "cwd", "-u", str(os.getuid()), "-Fpn"],
+                             capture_output=True, text=True, timeout=25).stdout
+    except Exception as exc:
+        print(f"  warn: lsof cwd map unavailable ({str(exc)[:60]}); orphan-worker check degraded", file=sys.stderr)
+        return m
+    for line in out.splitlines():
+        if line[:1] == "p":
+            pid = int(line[1:])
+        elif line[:1] == "n" and pid:
+            m[pid] = line[1:]
+    return m
+
+
+def orphan_workers(cwd, sid, table, cwds):
+    """Double-forked background work (`nohup … &`, setsid): the Bash wrapper is gone and
+    the worker hangs off launchd (ppid 1), but it still runs in the session's cwd or
+    names the session's scratchpad."""
+    out = []
+    for pid, (ppid, _, cmd) in table.items():
+        if ppid != 1 or "claude" in cmd or any(h in cmd for h in HELPER_PATTERNS):
+            continue
+        if f"/{sid}/" in cmd or (cwd and cwds.get(pid) == cwd):
+            out.append("bg worker " + cmd.split()[0].rsplit("/", 1)[-1])
+    return out
+
+
+def iterm_query(script):
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"cannot talk to iTerm2 ({r.stderr.strip()[:120]}); refusing to hibernate blind")
+    return r.stdout
+
+
+def visible_ttys():
+    out = iterm_query('tell application "iTerm2" to get tty of current session of every window')
+    return {t.strip().replace("/dev/", "") for t in out.replace(",", " ").split() if t.strip()}
+
+
+def iterm_ids():
+    """tty -> iTerm2 session GUID. Stored in the manifest so a resumer can tell the
+    original tab from a NEW tab that later reuses the same tty number."""
+    out = iterm_query('''tell application "iTerm2"
+set o to ""
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+set o to o & (tty of s) & (character id 9) & (id of s) & linefeed
+end repeat
+end repeat
+end repeat
+return o
+end tell''')
+    d = {}
+    for line in out.splitlines():
+        if "\t" in line:
+            tty, sid = line.split("\t", 1)
+            d[tty.strip().replace("/dev/", "")] = sid.strip()
+    return d
+
+
+def iterm_titles():
+    out = iterm_query('''tell application "iTerm2"
+set o to ""
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+set o to o & (tty of s) & (character id 9) & (name of s) & linefeed
+end repeat
+end repeat
+end repeat
+return o
+end tell''')
+    d = {}
+    for line in out.splitlines():
+        if "\t" in line:
+            tty, name = line.split("\t", 1)
+            d[tty.replace("/dev/", "")] = clean_title(name)
+    return d
+
+
+def clean_title(name):
+    """'◐ Floating WhatsApp icon (node)' -> 'Floating WhatsApp icon'."""
+    name = name.strip()
+    name = re.sub(r"^[\u2600-\u27bf\u25d0-\u25d3\u2b50\u2733\u2714\u2716\s]+", "", name)
+    name = re.sub(r"\s\((?:node|-?zsh|-?bash|login)\)$", "", name)
+    name = re.sub(r"^\[(hibernated|moved to cmux)\]\s*", "", name)
+    return name.strip()
+
+
+GENERIC_TITLES = {"zsh", "bash", "login", "claude", "claude code", "node"}
+
+
+_PREV_TITLES = None
+
+
+def previous_title(cwd):
+    """Newest non-generic title recorded in any manifest for a session in this cwd
+    (manifests parsed once per run, not once per session)."""
+    global _PREV_TITLES
+    if _PREV_TITLES is None:
+        _PREV_TITLES = {}
+        for p in sorted(glob.glob(str(STATE / "manifest-*.json"))):
+            try:
+                for e in json.loads(Path(p).read_text())["entries"]:
+                    t = (e.get("title") or "").strip()
+                    if t and t.lower() not in GENERIC_TITLES and t != e.get("name"):
+                        _PREV_TITLES[e.get("cwd")] = t
+            except Exception:
+                continue
+    return _PREV_TITLES.get(cwd)
+
+
+def transcript_title(lines):
+    """Claude Code's own title for a session (custom-title beats ai-title); titles are
+    rewritten near the end of the transcript, so the tail is enough."""
+    best = None
+    for raw in lines:
+        if b'"type":"custom-title"' in raw or b'"type":"ai-title"' in raw:
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            t = d.get("customTitle") or d.get("aiTitle")
+            if t and (d.get("type") == "custom-title" or not best or best[0] != "custom-title"):
+                best = (d.get("type"), t)
+    return best[1] if best else None
+
+
+def live_sessions():
+    table = ps_table()
+    cwds = cwd_map()
+    rows = []
+    for f in SESS.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        pid = d.get("pid")
+        if not pid or not alive(pid):
+            continue
+        if d.get("kind") != "interactive" or d.get("entrypoint") != "cli":
+            continue
+        cmd = table.get(pid, (0, "?", ""))[2]
+        if "claude" not in cmd:
+            continue
+        sid = d.get("sessionId")
+        tail = transcript_tail(sid)
+        rows.append({
+            "working": working_children(pid, table) + orphan_workers(d.get("cwd"), sid, table, cwds),
+            "activity": activity_ms(sid),
+            "pending": pending_work(tail), "transcriptTitle": transcript_title(tail),
+            "pid": pid, "sessionId": d.get("sessionId"), "cwd": d.get("cwd"),
+            "name": d.get("name"), "status": d.get("status"),
+            "statusUpdatedAt": d.get("statusUpdatedAt") or d.get("updatedAt") or 0,
+            "tty": table.get(pid, (0, "?", ""))[1], "terminal": terminal_of(pid, table),
+        })
+    rows.sort(key=lambda r: r["tty"])
+    return rows
+
+
+PRETYPE = '''on run argv
+set cmd to item 1 of argv
+set wanted to item 2 of argv
+set ttl to item 3 of argv
+tell application "iTerm2"
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+if (tty of s) is wanted then
+tell s
+write text (character id 21) newline NO
+write text cmd newline NO
+set name to ttl
+end tell
+return "ok"
+end if
+end repeat
+end repeat
+end repeat
+end tell
+return "notfound"
+end run'''
+
+def resume_dir(cwd):
+    """Directory to resume in. A deleted `<repo>/.claude/worktrees/<name>` falls back to
+    <repo> (Claude Code removes a worktree once its branch is merged and the tree is
+    clean); anything else falls back to the nearest existing ancestor."""
+    p = Path(cwd)
+    if p.is_dir():
+        return str(p), False
+    parts = p.parts
+    if len(parts) >= 4 and parts[-3:-1] == (".claude", "worktrees"):
+        repo = Path(*parts[:-3])
+        if repo.is_dir():
+            return str(repo), True
+    while not p.is_dir() and p != p.parent:
+        p = p.parent
+    return str(p), True
+
+
+def pretype(e):
+    """Leave `cd .. && claude --resume ..` typed (not submitted) in the hibernated iTerm2 tab."""
+    resume = "" if e.get("empty") else f" --resume {e['sessionId']}"
+    cmd = f"cd {resume_dir(e['cwd'])[0]} && claude{resume}"
+    r = subprocess.run(["osascript", "-e", PRETYPE, cmd, f"/dev/{e['tty']}", f"[hibernated] {e['title']}"],
+                       capture_output=True, text=True)
+    return "ok" in r.stdout
+
+
+def mark_tty(tty, title, sid, empty=False):
+    if empty:
+        body = ("idle session ended to free RAM; it had no messages, so there is nothing to resume."
+                "\r\n  press Enter to start a fresh session here")
+    else:
+        body = ("idle session ended to free RAM; transcript intact."
+                f"\r\n  press Enter to resume here   (or: cc-wake --tty {tty})")
+    try:
+        with open(f"/dev/{tty}", "w") as f:
+            f.write(TTY_RESET)
+            f.write(f"\x1b]0;[hibernated] {title}\x07")
+            f.write(f"\r\n\x1b[2m[cc-hibernate] {title}\r\n  {body}\x1b[0m\r\n")
+        return True
+    except OSError:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--terminal", default="all", help="iterm2 | cmux | terminal | all")
+    ap.add_argument("--except", dest="skip", default="", help="comma-separated session ids to keep")
+    ap.add_argument("--idle-hours", type=float, default=0)
+    ap.add_argument("--idle-minutes", type=float, default=0, help="only sessions idle at least this long")
+    ap.add_argument("--idle-only", action="store_true", help="skip sessions waiting on a prompt/permission")
+    ap.add_argument("--include-busy", action="store_true")
+    ap.add_argument("--skip-visible", action="store_true", help="never touch the tab shown in each iTerm2 window")
+    ap.add_argument("--quiet", action="store_true", help="only print when something is hibernated")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    idle_ms = (a.idle_hours * 60 + a.idle_minutes) * 60e3
+    safe = {"idle"} if a.idle_only else {"idle", "waiting"}
+    skip = {s.strip() for s in a.skip.split(",") if s.strip()}
+    if os.environ.get("CLAUDE_SESSION_ID"):
+        skip.add(os.environ["CLAUDE_SESSION_ID"])
+    visible = visible_ttys() if a.skip_visible else set()
+    titles = iterm_titles() if a.terminal in ("iterm2", "all") else {}
+    iterm_guids = iterm_ids() if a.terminal in ("iterm2", "all") else {}
+    now = time.time() * 1000
+    targets, kept = [], []
+    for r in live_sessions():
+        t = titles.get(r["tty"], "")
+        if not t or t.lower() in GENERIC_TITLES or t == r["name"]:
+            # after /clear the tab reads "Claude Code" until the new session gets a title;
+            # keep the last real title seen for this directory so the tab stays recognizable
+            t = r["transcriptTitle"] or previous_title(r["cwd"]) or r["name"] or r["sessionId"][:8]
+        r["title"] = t
+        r["itermId"] = iterm_guids.get(r["tty"])
+        p = r["pending"]
+        why = None
+        if a.terminal != "all" and r["terminal"] != a.terminal:
+            why = f"terminal={r['terminal']}"
+        elif r["sessionId"] in skip:
+            why = "excluded"
+        elif r["tty"] in visible:
+            why = "visible tab"
+        elif r["status"] not in safe and not a.include_busy:
+            why = f"status={r['status']}"
+        elif r["working"] and not a.include_busy:
+            why = f"running: {', '.join(sorted(set(r['working']))[:2])}"
+        elif p["queued"] and not a.include_busy and (now - p["queued_at"]) < QUEUED_MAX_AGE_MS:
+            why = f"queued input x{p['queued']}"
+        elif p["limit_resets_at"] and not a.include_busy and now < p["limit_resets_at"] + LIMIT_GRACE_MS:
+            why = f"usage limit, resumes {time.strftime('%H:%M', time.localtime(p['limit_resets_at'] / 1000))}"
+        elif idle_ms and (now - r["statusUpdatedAt"]) < idle_ms:
+            why = f"idle {int((now - r['statusUpdatedAt']) / 60e3)}m"
+        elif idle_ms and (now - r["activity"]) < idle_ms:
+            why = f"active {int((now - r['activity']) / 60e3)}m ago (files)"
+        (kept if why else targets).append((r, why))
+    if a.quiet and not targets:
+        return
+    print(time.strftime("%Y-%m-%d %H:%M:%S"))
+    for r, why in kept:
+        print(f"  keep  {r['tty']:8} {r['sessionId'][:8]}  {why:26} {r['title'][:50]}")
+    for r, _ in targets:
+        print(f"  {'WOULD ' if a.dry_run else ''}hibernate  {r['tty']:8} {r['sessionId'][:8]}  {r['status']:8} {r['title'][:50]}")
+    print(f"{len(targets)} to hibernate, {len(kept)} kept")
+    if a.dry_run or not targets:
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    manifest = {"createdAt": ts, "entries": []}
+    for r, _ in targets:
+        try:
+            os.kill(r["pid"], signal.SIGKILL)
+        except OSError as e:
+            print(f"  FAILED {r['pid']}: {e}")
+            continue
+        # empty sessions are born "woken" so cc-wake / cc-tabwatch never try to resume them
+        empty = not has_transcript(r["sessionId"])
+        manifest["entries"].append({**r, "killedAt": ts, "woken": empty, "empty": empty})
+    time.sleep(2)
+    for e in manifest["entries"]:
+        if e["tty"].startswith("ttys"):
+            mark_tty(e["tty"], e["title"], e["sessionId"], e["empty"])
+            if e["terminal"] == "iterm2":
+                pretype(e)
+    still = [e["pid"] for e in manifest["entries"] if alive(e["pid"])]
+    path = STATE / f"manifest-{ts}.json"
+    path.write_text(json.dumps(manifest, indent=1))
+    latest = STATE / "latest.json"
+    if latest.is_symlink() or latest.exists():
+        latest.unlink()
+    latest.symlink_to(path.name)
+    print(f"hibernated {len(manifest['entries'])}; manifest {path}")
+    if still:
+        print(f"WARNING still alive: {still}")
+
+
+if __name__ == "__main__":
+    main()

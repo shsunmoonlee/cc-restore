@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""cc-wake — bring hibernated Claude Code sessions back (full transcript).
+
+Reads every manifest written by `cc-hibernate` (all of ~/.claude/state/hibernate/).
+With no selector it just LISTS what is hibernated. Wakes happen one at a time:
+`cd <cwd> && claude --resume <id>` typed into the original iTerm2 tab when it still
+exists (else a new tab / cmux workspace), wait for the session to register idle,
+then check free memory before the next one.
+
+  cc-wake                       # list hibernated sessions (default)
+  cc-wake --tty ttys033         # wake the session that lived in that iTerm2 tab
+  cc-wake --only <sid>[,<sid>]  # wake by session id (prefix ok)
+  cc-wake --all [--limit N]     # wake everything, memory-gated
+  cc-wake --terminal cmux ...   # target cmux instead of iTerm2 (default: where it came from)
+"""
+import argparse, json, os, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+SESS = HOME / ".claude" / "sessions"
+STATE = HOME / ".claude" / "state" / "hibernate"
+
+CMUX_SCRIPT = '''on run argv
+set cmd to item 1 of argv
+with timeout of 120 seconds
+tell application "cmux"
+set t to new tab
+delay 3
+input text (cmd & "\\n") to (focused terminal of t)
+return id of t
+end tell
+end timeout
+end run'''
+
+ITERM_INPLACE_SCRIPT = '''on run argv
+set cmd to item 1 of argv
+set wanted to item 2 of argv
+set guid to ""
+if (count of argv) > 2 then set guid to item 3 of argv
+tell application "iTerm2"
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+if (tty of s) is wanted and (guid is "" or (id of s) is guid) then
+tell s to write text cmd
+tell t to select
+return "inplace"
+end if
+end repeat
+end repeat
+end repeat
+end tell
+return "notfound"
+end run'''
+
+ITERM_NEWTAB_SCRIPT = '''on run argv
+set cmd to item 1 of argv
+tell application "iTerm2"
+tell current window
+set t to (create tab with default profile)
+tell current session of t to write text cmd
+end tell
+end tell
+end run'''
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def running_ids():
+    ids = {}
+    for f in SESS.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        if d.get("pid") and alive(d["pid"]):
+            ids[d.get("sessionId")] = d
+    return ids
+
+
+def free_pct():
+    out = subprocess.run(["memory_pressure"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if "free percentage" in line:
+            return int(line.rsplit(":", 1)[1].strip().rstrip("%"))
+    return -1
+
+def resume_dir(cwd):
+    """Directory to resume in. A deleted `<repo>/.claude/worktrees/<name>` falls back to
+    <repo> (Claude Code removes a worktree once its branch is merged and the tree is
+    clean); anything else falls back to the nearest existing ancestor."""
+    p = Path(cwd)
+    if p.is_dir():
+        return str(p), False
+    parts = p.parts
+    if len(parts) >= 4 and parts[-3:-1] == (".claude", "worktrees"):
+        repo = Path(*parts[:-3])
+        if repo.is_dir():
+            return str(repo), True
+    while not p.is_dir() and p != p.parent:
+        p = p.parent
+    return str(p), True
+
+
+def load_manifests():
+    ms = []
+    for p in sorted(STATE.glob("manifest-*.json")):
+        try:
+            ms.append((p, json.loads(p.read_text())))
+        except Exception:
+            pass
+    return ms
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tty", default="", help="wake the session hibernated from this iTerm2 tty")
+    ap.add_argument("--only", default="", help="comma-separated session ids (prefixes ok)")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--terminal", default="", choices=["", "cmux", "iterm2"], help="default: the terminal it was hibernated from")
+    ap.add_argument("--min-free-pct", type=int, default=20)
+    ap.add_argument("--settle-secs", type=int, default=120)
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    running = running_ids()
+    pending = []
+    for path, m in load_manifests():
+        for e in m["entries"]:
+            if e.get("woken") or e["sessionId"] in running:
+                continue
+            pending.append((path, m, e))
+    # newest manifest entry wins for a session id hibernated more than once
+    seen = {}
+    for item in pending:
+        seen[item[2]["sessionId"]] = item
+    pending = sorted(seen.values(), key=lambda x: (x[2].get("terminal", ""), x[2].get("tty", "")))
+    only = {s.strip() for s in a.only.split(",") if s.strip()}
+    if a.tty:
+        want = a.tty if a.tty.startswith("ttys") else f"ttys{a.tty}"
+        todo = [x for x in pending if x[2].get("tty") == want]
+    elif only:
+        todo = [x for x in pending if any(x[2]["sessionId"].startswith(o) for o in only)]
+    elif a.all:
+        todo = list(pending)
+    else:
+        print(f"{len(pending)} hibernated session(s)  (free RAM {free_pct()}%)")
+        for _, _, e in pending:
+            k = e.get('killedAt', '')
+            print(f"  {e.get('terminal','?'):6} {e.get('tty','?'):8} {e['sessionId'][:8]}  {k[9:11]}:{k[11:13]}  {e.get('title') or e.get('name','')}"[:110])
+        print("wake one: cc-wake --tty <tty>   or   cc-wake --only <sid>   |   all: cc-wake --all")
+        return
+    if a.limit:
+        todo = todo[: a.limit]
+    print(f"{len(todo)} to wake (free {free_pct()}%)")
+    if a.dry_run or not todo:
+        for _, _, e in todo:
+            print(f"  {e['sessionId'][:8]}  {e.get('tty')}  {e['cwd'].replace(str(HOME), '~')}")
+        return
+    for i, (path, m, e) in enumerate(todo, 1):
+        sid, cwd = e["sessionId"], e["cwd"]
+        term = a.terminal or ("cmux" if e.get("terminal") == "cmux" else "iterm2")
+        cwd, fell_back = resume_dir(cwd)
+        if fell_back:
+            print(f"[{i}/{len(todo)}] {sid[:8]} cwd {e['cwd']} is gone; resuming in {cwd}")
+        waited = 0
+        while free_pct() < a.min_free_pct and waited < a.settle_secs * 2:
+            print(f"    free {free_pct()}% < {a.min_free_pct}%, waiting for memory"); time.sleep(15); waited += 15
+        if free_pct() < a.min_free_pct:
+            print(f"STOP: free memory still {free_pct()}%. Hibernate something first, or rerun later."); return
+        if term == "cmux" and not subprocess.run(["pgrep", "-x", "cmux"], capture_output=True).stdout:
+            subprocess.run(["open", "-a", "cmux"]); time.sleep(6)
+        cmd = f"cd {cwd} && claude --resume {sid}"
+        r = None
+        if term == "iterm2" and e.get("tty", "").startswith("ttys"):
+            r = subprocess.run(["osascript", "-e", ITERM_INPLACE_SCRIPT, cmd, f"/dev/{e['tty']}", e.get("itermId") or ""], capture_output=True, text=True)
+            if r.returncode == 0 and "inplace" in r.stdout:
+                print(f"    resuming in its original tab ({e['tty']})")
+            else:
+                r = None
+        if r is None:
+            r = subprocess.run(["osascript", "-e", CMUX_SCRIPT if term == "cmux" else ITERM_NEWTAB_SCRIPT, cmd], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[{i}/{len(todo)}] {sid[:8]} osascript failed: {r.stderr.strip()[:160]}"); continue
+        t0 = time.time(); state = None
+        while time.time() - t0 < a.settle_secs:
+            d = running_ids().get(sid)
+            if d and d.get("status") in ("idle", "waiting") and time.time() - t0 > 8:
+                state = d; break
+            time.sleep(3)
+        if state:
+            e["woken"] = True; e["wokenAt"] = time.strftime("%Y%m%d-%H%M%S"); e["newPid"] = state["pid"]
+            print(f"[{i}/{len(todo)}] {sid[:8]} up in {term} (pid {state['pid']}, {int(time.time() - t0)}s, free {free_pct()}%)")
+        else:
+            print(f"[{i}/{len(todo)}] {sid[:8]} did not register within {a.settle_secs}s; check the tab (left hibernated)")
+        path.write_text(json.dumps(m, indent=1))
+
+
+if __name__ == "__main__":
+    main()
