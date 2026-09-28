@@ -9,7 +9,8 @@ No hook covers these, so they are read from the transcript tail (last 2 MB), fai
   - a usage-limit 429 (isApiErrorMessage, error rate_limit, quotaLimits.status rejected,
     quotaLimits.resetsAt) whose reset + 15 min grace has not passed, with no later
     user/assistant record ("Continue automatically at usage limit" waits as idle).
-An unreadable or unparseable transcript is pending ["unreadable"].
+An unreadable transcript, or any malformed record other than a torn last line, is
+pending ["unreadable"].
 
 Output keys match the v1 `cc-pending-work` script: {"pending": [...], "last_text": "..."}.
 """
@@ -25,6 +26,7 @@ QUEUED_MAX_AGE_S = 24 * 3600
 LIMIT_GRACE_S = 15 * 60
 WAKE_SLACK_S = 120
 TASK_ID = re.compile(rb"<task-id>([^<]+)</task-id>")
+NOTIFICATION = re.compile(rb"<task-notification>.*?</task-notification>", re.S)
 INTERRUPTED = "[Request interrupted by user"
 
 
@@ -61,10 +63,50 @@ def _text_of(content):
     return ""
 
 
+def is_real_user(d):
+    """A message the person typed: non-sidechain user record whose content is text (a
+    tool_result-only record is the harness answering a tool call, not a user)."""
+    if d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta"):
+        return False
+    c = (d.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return bool(c.strip())
+    if isinstance(c, list):
+        return any(isinstance(x, dict) and x.get("type") == "text" and (x.get("text") or "").strip()
+                   for x in c)
+    return False
+
+
+def head_has_user(path, nbytes=TAIL_BYTES):
+    try:
+        with open(path, "rb") as fh:
+            for raw in fh.read(nbytes).splitlines():
+                if b'"user"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and is_real_user(d):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def notified_ids(raw):
+    """Task ids inside a real <task-notification>...</task-notification> envelope."""
+    out = set()
+    for env in NOTIFICATION.findall(raw):
+        out.update(m.decode("utf-8", "replace") for m in TASK_ID.findall(env))
+    return out
+
+
 def analyze(path, now=None):
     """Everything the daemon and CLI need from one pass over the tail:
     pending, last_text, last_kind ('user'|'assistant'|None), last_user_text, has_user,
-    title (custom-title beats ai-title)."""
+    title (custom-title beats ai-title). Fails closed: a malformed record anywhere but
+    the (possibly half-written) last line makes the transcript "unreadable"."""
     now = time.time() if now is None else now
     res = {"pending": [], "last_text": "", "last_kind": None, "last_user_text": "",
            "has_user": False, "title": None}
@@ -72,34 +114,33 @@ def analyze(path, now=None):
         res["pending"] = ["unreadable"]
         return res
     try:
-        lines, truncated = read_tail(path)
+        lines, truncated = read_tail(path, TAIL_BYTES)
     except OSError:
         res["pending"] = ["unreadable"]
         return res
-    if truncated:
-        res["has_user"] = True  # a 2 MB+ transcript had a first message
     launched, finished = {}, set()
     queued = []
     wake_until = 0.0
     limit_reset = 0.0
-    parsed = bad = 0
     title = None
+    open_tools = set()
+    last_conv = None
+    last_idx = max((i for i, l in enumerate(lines) if l.strip()), default=-1)
     for i, raw in enumerate(lines):
         if not raw.strip():
             continue
-        if b"<task-id>" in raw:
-            finished.update(m.decode("utf-8", "replace") for m in TASK_ID.findall(raw))
         try:
             d = json.loads(raw)
         except ValueError:
-            if i != len(lines) - 1:  # a half-written last line is normal
-                bad += 1
-            continue
+            d = None
         if not isinstance(d, dict):
-            bad += 1
-            continue
-        parsed += 1
+            if i == last_idx and d is None:
+                continue  # a torn last line is a write in progress
+            res["pending"] = ["unreadable"]
+            return res
         typ = d.get("type")
+        if typ != "assistant" and b"<task-notification>" in raw:
+            finished.update(notified_ids(raw))
         if typ == "queue-operation":
             op = d.get("operation")
             if op == "enqueue":
@@ -130,41 +171,52 @@ def analyze(path, now=None):
                 launched[str(r["backgroundTaskId"])] = ("background command", ts_of(d, now))
             elif r.get("taskId") and "timeoutMs" in r:
                 launched[str(r["taskId"])] = ("monitor", ts_of(d, now))
-        if typ in ("user", "assistant"):
-            limit_reset = 0.0
-            msg = d.get("message") or {}
-            if typ == "user" and not d.get("isSidechain"):
+        if typ not in ("user", "assistant"):
+            continue
+        limit_reset = 0.0
+        msg = d.get("message") or {}
+        content = msg.get("content") if isinstance(msg.get("content"), list) else []
+        if not d.get("isSidechain"):
+            last_conv = (typ, d)
+        if typ == "user":
+            if is_real_user(d):
                 res["has_user"] = True
+            if not d.get("isSidechain"):
                 res["last_kind"] = "user"
                 res["last_user_text"] = _text_of(msg.get("content"))
-            elif typ == "assistant":
-                res["last_kind"] = "assistant"
-            for c in (msg.get("content") if isinstance(msg.get("content"), list) else []) or []:
-                if not isinstance(c, dict):
-                    continue
-                if typ == "assistant" and c.get("type") == "text" and (c.get("text") or "").strip():
-                    res["last_text"] = c["text"].strip()
-                if c.get("type") != "tool_use":
-                    continue
-                inp = c.get("input") or {}
-                if c.get("name") == "ScheduleWakeup":
-                    if inp.get("stop"):
-                        wake_until = 0.0
-                    else:
-                        try:
-                            delay = float(inp.get("delaySeconds") or 0)
-                        except (TypeError, ValueError):
-                            delay = 0.0
-                        wake_until = ts_of(d, now) + delay + WAKE_SLACK_S
-                elif c.get("name") == "TaskStop":
-                    for k in ("task_id", "taskId", "id"):
-                        if inp.get(k):
-                            finished.add(str(inp[k]))
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("tool_use_id"):
+                    open_tools.discard(str(c["tool_use_id"]))
+            continue
+        if not d.get("isSidechain"):
+            res["last_kind"] = "assistant"
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text" and (c.get("text") or "").strip():
+                res["last_text"] = c["text"].strip()
+            if c.get("type") != "tool_use":
+                continue
+            if c.get("id") and not d.get("isSidechain"):
+                open_tools.add(str(c["id"]))
+            inp = c.get("input") or {}
+            if c.get("name") == "ScheduleWakeup":
+                if inp.get("stop"):
+                    wake_until = 0.0
+                else:
+                    try:
+                        delay = float(inp.get("delaySeconds") or 0)
+                    except (TypeError, ValueError):
+                        delay = 0.0
+                    wake_until = ts_of(d, now) + delay + WAKE_SLACK_S
+            elif c.get("name") == "TaskStop":
+                for k in ("task_id", "taskId", "id"):
+                    if inp.get(k):
+                        finished.add(str(inp[k]))
     if title:
         res["title"] = title[1]
-    if lines and parsed == 0 and bad:
-        res["pending"] = ["unreadable"]
-        return res
+    if not res["has_user"] and truncated:
+        res["has_user"] = head_has_user(path, TAIL_BYTES)
     pending, counts = [], {}
     for tid, (kind, t0) in launched.items():
         if tid in finished or now - t0 > STALE_LAUNCH_S:
@@ -179,6 +231,11 @@ def analyze(path, now=None):
         pending.append("loop wakeup scheduled")
     if limit_reset and now < limit_reset + LIMIT_GRACE_S:
         pending.append("usage limit wait until %s" % time.strftime("%H:%M", time.localtime(limit_reset)))
+    if last_conv and last_conv[0] == "assistant":
+        ids = {str(c.get("id")) for c in ((last_conv[1].get("message") or {}).get("content") or [])
+               if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("id")}
+        if ids & open_tools:
+            pending.append("tool in flight")
     res["pending"] = pending
     return res
 

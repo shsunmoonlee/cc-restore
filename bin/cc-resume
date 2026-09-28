@@ -15,8 +15,9 @@ parked branch exists, undoes the park first:
   3. copy <archive>/<name>/files/ back without overwriting
 then execs `claude --resume <id>` there. Nothing here deletes.
 
-Refuses (exit 1) when the ledger shows the session's process still running, and marks
-the ledger row `resuming` (tolerating a missing ledger).
+Refuses (exit 1) when the ledger shows the session's process still running. Before exec
+it writes its own identity (pid + start) and state `resuming` into the row (tolerating a
+missing ledger), so a resume that comes up under a new id supersedes the row.
 Config keys (see cc-sessions): worktree_marker, park_archive_dir ({repo_key}),
 park_branch_prefix, park_commit_subject, claude_projects.
 """
@@ -150,13 +151,19 @@ def ledger_row(cfg, sid):
         return None
 
 
-def mark_resuming(cfg, sid):
+def mark_resuming(cfg, sid, pid=None, pid_start=None):
+    """Write this process's identity + state resuming into the row before exec (exec keeps
+    pid and start time, so the claude that follows IS this identity)."""
     try:
         if not os.path.exists(cfg.path("db")):
             return
+        if pid is None:
+            pid = os.getpid()
+            info = procs.proc_info(pid)
+            pid_start = info["pid_start"] if info else None
         conn = ledger.connect(cfg.path("db"))
         try:
-            ledger.mark_resuming(conn, sid)
+            ledger.claim_resume(conn, sid, pid, pid_start)
         finally:
             conn.close()
     except Exception:

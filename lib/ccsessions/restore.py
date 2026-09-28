@@ -18,6 +18,7 @@ from . import PARKED_STATES, SUPERSEDED, procs, resumecmd
 
 CLUSTER_ANCHOR_S = 300
 CLUSTER_GAP_S = 30
+BLIND = "hibernated (iTerm2 tabs unknown)"
 
 
 def shutdown_cluster(rows, boot):
@@ -64,11 +65,19 @@ def select(rows, boot, now, cfg, alive_fn, auto=False, include_hibernated=False,
         if st in PARKED_STATES:
             if include_hibernated:
                 bucket = typed
-            elif auto and r.get("iterm_guid") and live_guids is not None \
-                    and r["iterm_guid"] not in live_guids:
+            elif not auto:
+                skipped.append((r, "hibernated"))
+                continue
+            elif r.get("restored_at"):
+                skipped.append((r, "hibernated (already retyped into a tab)"))
+                continue
+            elif live_guids is None:
+                skipped.append((r, BLIND))
+                continue
+            elif r.get("iterm_guid") and r["iterm_guid"] not in live_guids:
                 bucket = typed
             else:
-                skipped.append((r, "hibernated (tab still open)" if auto else "hibernated"))
+                skipped.append((r, "hibernated (tab still open)"))
                 continue
         elif r.get("ended_at") is None:
             bucket = run
@@ -93,20 +102,22 @@ def select(rows, boot, now, cfg, alive_fn, auto=False, include_hibernated=False,
 
 def osascript_for(tabs):
     """tabs: [(command, run_it)] -> AppleScript opening one window, one tab each."""
-    lines = ['tell application "iTerm2"', "activate",
+    lines = ['set o to ""', 'tell application "iTerm2"', "activate",
              "set w to (create window with default profile)", "set first_done to false"]
     for cmd, run_it in tabs:
         esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
         wt = 'write text "%s"%s' % (esc, "" if run_it else " newline NO")
         lines += ["if first_done then",
                   "tell w to set t to (create tab with default profile)",
-                  "tell current session of t to " + wt,
+                  "set s to current session of t",
                   "else",
-                  "tell current session of w to " + wt,
+                  "set s to current session of w",
                   "set first_done to true",
                   "end if",
+                  "tell s to " + wt,
+                  "set o to o & (id of s) & linefeed",
                   "delay 0.4"]
-    lines.append("end tell")
+    lines += ["end tell", "return o"]
     return lines
 
 
@@ -151,13 +162,18 @@ def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=Fal
     guids = iterm_guids() if auto else None
     runs, typed, skipped = select(all_rows(conn), boot, time.time(), cfg, alive, auto=auto,
                                   include_hibernated=include_hibernated, live_guids=guids)
+    blind = auto and any(why == BLIND for _, why in skipped)
+    if blind:
+        out("iTerm2 tabs could not be listed: hibernated sessions skipped; the boot marker "
+            "is not written so the next run retries")
     for r, why in skipped:
         if why != "already running":
             out("  skip %s: %s" % (r["session_id"][:8], why))
     tabs = [(resumecmd.command(cfg, r["session_id"], r["cwd"]), True) for r in runs]
     tabs += [(resumecmd.command(cfg, r["session_id"], r["cwd"]), False) for r in typed]
     if not tabs:
-        write_mark()
+        if not blind:
+            write_mark()
         out("nothing to restore.")
         return 0
     if len(tabs) > limit:
@@ -173,7 +189,13 @@ def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=Fal
     args = ["osascript"]
     for l in osascript_for(tabs):
         args += ["-e", l]
-    subprocess.run(args, check=True)
-    write_mark()
+    r = subprocess.run(args, check=True, capture_output=True, text=True)
+    guids = [g.strip() for g in r.stdout.splitlines() if g.strip()]
+    from .ledger import mark_restored
+    for i, row in enumerate(typed):
+        g = guids[len(runs) + i] if len(guids) == len(tabs) else None
+        mark_restored(conn, row["session_id"], g)
+    if not blind:
+        write_mark()
     out("opened %d tabs." % len(tabs))
     return 0

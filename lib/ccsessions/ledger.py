@@ -14,11 +14,12 @@ from . import (BUSY, ENDED, EVICTING, HIBERNATED, IDLE, PARKED_STATES, RESUMING,
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions(
-  session_id TEXT PRIMARY KEY, pid INTEGER, pid_start TEXT, interactive INTEGER DEFAULT 1,
+  session_id TEXT PRIMARY KEY, pid INTEGER, pid_start INTEGER, interactive INTEGER DEFAULT 1,
   tty TEXT, cwd TEXT, launch_cwd TEXT, transcript TEXT, title TEXT,
   state TEXT, state_since REAL, last_event TEXT, last_event_at REAL,
   subagents INTEGER DEFAULT 0, started_at REAL, ended_at REAL, end_reason TEXT,
-  source TEXT, iterm_guid TEXT, last_focus_at REAL, resumed_at REAL, evicted_at REAL);
+  source TEXT, iterm_guid TEXT, last_focus_at REAL, resumed_at REAL, evicted_at REAL,
+  held_state TEXT, restored_at REAL);
 CREATE INDEX IF NOT EXISTS sessions_pid ON sessions(pid, pid_start);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, session_id TEXT,
   event TEXT, detail TEXT);
@@ -156,11 +157,13 @@ def apply_event(conn, event, payload, proc, now=None):
                     _set_state(fields, row, IDLE, now)
             else:
                 _set_state(fields, row, IDLE, now)
-            if proc and proc.get("pid") and proc.get("pid_start"):
+            if proc and proc.get("pid") and proc.get("pid_start") is not None:
+                # every other live-looking row of this exact process, evicting included:
+                # /clear and in-app /resume change the session id inside one process
                 others = conn.execute(
                     "SELECT session_id FROM sessions WHERE pid=? AND pid_start=? AND "
-                    "session_id<>? AND ended_at IS NULL AND state NOT IN (?,?)",
-                    (proc["pid"], proc["pid_start"], sid, HIBERNATED, EVICTING)).fetchall()
+                    "session_id<>? AND ended_at IS NULL AND state<>?",
+                    (proc["pid"], proc["pid_start"], sid, SUPERSEDED)).fetchall()
                 for o in others:
                     conn.execute("UPDATE sessions SET state=?, state_since=?, ended_at=?, "
                                  "end_reason='superseded' WHERE session_id=?",
@@ -180,24 +183,45 @@ def apply_event(conn, event, payload, proc, now=None):
             if nt in ("permission_prompt", "elicitation_dialog"):
                 _set_state(fields, row, WAITING, now)
             elif nt == "idle_prompt":
+                # only busy -> idle (Stop does not fire on Esc); waiting stays waiting
                 subs = fields.get("subagents", row.get("subagents") or 0)
-                if subs == 0 and state in (BUSY, WAITING, IDLE):
+                if subs == 0 and state == BUSY:
                     _set_state(fields, row, IDLE, now)
         elif event == "SessionEnd":
             reason = payload.get("reason") or "other"
             detail["reason"] = reason
             fields["end_reason"] = reason
-            ev_at = row.get("evicted_at")
-            if state == EVICTING or (ev_at and now - ev_at <= SESSION_END_HIBERNATE_WINDOW_S):
+            if is_eviction_end(row, reason, now):
                 _set_state(fields, row, HIBERNATED, now)
+                fields["held_state"] = None
             else:
                 _set_state(fields, row, ENDED, now)
                 fields["ended_at"] = now
+                fields["held_state"] = None
+        if state == EVICTING and event not in ("SessionEnd", "SessionStart") and "state" in fields:
+            # the daemon owns an evicting row's state; keep what the hook would have set so
+            # a rolled-back eviction restores it, and last_event_at tells the daemon's
+            # post-CAS re-check that the session moved
+            fields["held_state"] = fields.pop("state")
+            fields.pop("state_since", None)
+        elif event == "SessionStart":
+            fields["held_state"] = None
         cols = sorted(fields)
         conn.execute("UPDATE sessions SET %s WHERE session_id=?" % ", ".join("%s=?" % c for c in cols),
                      [fields[c] for c in cols] + [sid])
         add_event(conn, sid, event, detail, now)
         return get(conn, sid)
+
+
+def is_eviction_end(row, reason, now):
+    """A SessionEnd is the end of OUR eviction only with reason 'other' (what SIGTERM
+    produces) while evicting, or right after one that no resume has followed."""
+    if reason != "other":
+        return False
+    if row.get("state") == EVICTING:
+        return True
+    ev, ra = row.get("evicted_at"), row.get("resumed_at")
+    return bool(ev and now - ev <= SESSION_END_HIBERNATE_WINDOW_S and (ra is None or ra < ev))
 
 
 def state_of(conn, sid):
@@ -238,7 +262,7 @@ def evictions_today(conn, now=None):
     midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
     out = {}
     for r in conn.execute("SELECT session_id, COUNT(*) FROM evictions WHERE ts >= ? AND "
-                          "outcome <> 'aborted' GROUP BY session_id", (midnight,)):
+                          "outcome NOT IN ('aborted', 'started') GROUP BY session_id", (midnight,)):
         out[r[0]] = r[1]
     return out
 
@@ -271,12 +295,16 @@ def finish_eviction(conn, eviction_id, outcome, signal=None, detail=None):
                          (outcome, detail, eviction_id))
 
 
-def rollback_eviction(conn, sid, prev_state, now=None):
-    """Undo an evicting flip when the signal was never sent."""
+def rollback_eviction(conn, sid, prev_state, now=None, prev_since=None):
+    """Undo an evicting flip when no signal was sent. A state a hook recorded meanwhile
+    (held_state) wins over the state the guards saw."""
     now = time.time() if now is None else now
     with tx(conn):
-        conn.execute("UPDATE sessions SET state=?, state_since=?, evicted_at=NULL WHERE "
-                     "session_id=? AND state=?", (prev_state, now, sid, EVICTING))
+        conn.execute("UPDATE sessions SET state=COALESCE(held_state, ?), state_since=CASE WHEN "
+                     "held_state IS NULL THEN COALESCE(?, ?) ELSE ? END, held_state=NULL, "
+                     "evicted_at=NULL WHERE session_id=? AND state=?",
+                     (prev_state, prev_since, now, now, sid, EVICTING))
+        add_event(conn, sid, "evict-rollback", None, now)
 
 
 def mark_hibernated(conn, sid, now=None, only_from=(EVICTING,)):
@@ -298,11 +326,48 @@ def mark_resuming(conn, sid, now=None):
         return cur.rowcount
 
 
+def claim_resume(conn, sid, pid, pid_start, now=None):
+    """cc-resume, just before it execs claude in its own process: the row takes this
+    process's identity (exec keeps pid and start time), so SessionStart's supersede applies
+    if the resume comes up under a new session id. Parked rows move to resuming."""
+    now = time.time() if now is None else now
+    with tx(conn):
+        cur = conn.execute("UPDATE sessions SET pid=?, pid_start=?, state=CASE WHEN state IN (?,?,?) "
+                           "THEN ? ELSE state END, state_since=? WHERE session_id=?",
+                           (pid, pid_start, HIBERNATED, EVICTING, RESUMING, RESUMING, now, sid))
+        if cur.rowcount:
+            add_event(conn, sid, "resuming", {"pid": pid}, now)
+        return cur.rowcount
+
+
 def set_focus(conn, sid, guid, now=None):
     now = time.time() if now is None else now
     with tx(conn):
         conn.execute("UPDATE sessions SET iterm_guid=?, last_focus_at=? WHERE session_id=?",
                      (guid, now, sid))
+
+
+def stamp_visible(conn, tty_guid, now=None):
+    """last_focus_at = now for every live row whose tty is shown right now (all panes of
+    each window's current tab), so it records the last time a session was SEEN."""
+    now = time.time() if now is None else now
+    if not tty_guid:
+        return 0
+    n = 0
+    with tx(conn):
+        for tty, guid in tty_guid.items():
+            cur = conn.execute("UPDATE sessions SET last_focus_at=?, iterm_guid=? WHERE tty=? AND "
+                               "ended_at IS NULL AND state IN (?,?,?)",
+                               (now, guid, tty, BUSY, IDLE, WAITING))
+            n += cur.rowcount
+    return n
+
+
+def mark_restored(conn, sid, guid, now=None):
+    now = time.time() if now is None else now
+    with tx(conn):
+        conn.execute("UPDATE sessions SET restored_at=?, iterm_guid=COALESCE(?, iterm_guid) WHERE "
+                     "session_id=?", (now, guid, sid))
 
 
 def set_guid(conn, sid, guid):

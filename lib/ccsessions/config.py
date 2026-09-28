@@ -37,6 +37,7 @@ DEFAULTS = {
     "settle_s": 10,
     "backoff_min": 10,
     "restore_limit": 40,
+    "wake_all_limit": 10,
     "restore_max_age_days": 7,
     "bootmark": "~/.cache/cc-sessions.bootmark",
     # What gets typed into a tab to resume a session. null = the cc-resume installed

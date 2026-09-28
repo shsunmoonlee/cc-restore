@@ -3,21 +3,39 @@
 Process identity is (pid, start time): a pid alone is reused by the OS, so every check
 that asks "is this row's process still running" compares the stored `pid_start` too.
 """
+import calendar
 import os
 import re
 import subprocess
+import time
 
-PS_ENV = dict(os.environ, LC_ALL="C", LANG="C")
+# LC_ALL=C fixes the lstart format; TZ=UTC0 makes it timezone-independent, so the parsed
+# epoch is the same whatever zone the caller (hook, daemon, launchd) runs in.
+PS_ENV = dict(os.environ, LC_ALL="C", LANG="C", TZ="UTC0")
 CLAUDE_COMM = "claude"
 SHELL_JOBS = ("zsh", "-zsh", "bash", "-bash", "fish", "-fish", "sh", "-sh", "login")
+
+ALIVE, GONE, UNKNOWN = "alive", "gone", "unknown"
+
+
+class ProcsError(Exception):
+    """ps could not be run or timed out: the answer is unknown, not 'absent'."""
+
+
+def _run_rc(args, timeout=10):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=PS_ENV)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProcsError(str(exc))
+    return r.returncode, r.stdout
 
 
 def _run(args, timeout=10):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=PS_ENV)
-    except (OSError, subprocess.SubprocessError):
+        rc, out = _run_rc(args, timeout)
+    except ProcsError:
         return None
-    return r.stdout if r.returncode == 0 else None
+    return out if rc == 0 else None
 
 
 def norm_tty(tty):
@@ -70,12 +88,24 @@ def find_claude(start_pid, tree, max_steps=6):
     return None
 
 
+def lstart_epoch(tokens):
+    """Five `ps -o lstart=` tokens printed under TZ=UTC0 -> epoch seconds (int)."""
+    try:
+        return int(calendar.timegm(time.strptime(" ".join(tokens), "%a %b %d %H:%M:%S %Y")))
+    except (ValueError, TypeError):
+        return None
+
+
 def parse_proc_info(out):
-    """`ps -o lstart=,tty=,command= -p PID` -> {pid_start, tty, command} or None."""
+    """`ps -o lstart=,tty=,command= -p PID` (TZ=UTC0) -> {pid_start, tty, command} or None.
+    pid_start is epoch seconds."""
     toks = (out or "").strip().split(None, 6)
     if len(toks) < 6:
         return None
-    return {"pid_start": " ".join(toks[:5]), "tty": norm_tty(toks[5]),
+    start = lstart_epoch(toks[:5])
+    if start is None:
+        return None
+    return {"pid_start": start, "tty": norm_tty(toks[5]),
             "command": toks[6] if len(toks) > 6 else ""}
 
 
@@ -83,26 +113,47 @@ def proc_info(pid):
     return parse_proc_info(_run(["ps", "-o", "lstart=,tty=,command=", "-p", str(pid)]))
 
 
-def lstart_comm(pid):
-    """(lstart, comm) for a running pid, or None."""
-    out = _run(["ps", "-o", "lstart=,comm=", "-p", str(pid)])
+def parse_lstart_comm(out):
     toks = (out or "").strip().split(None, 5)
     if len(toks) < 6:
         return None
-    return " ".join(toks[:5]), toks[5]
+    start = lstart_epoch(toks[:5])
+    return None if start is None else (start, toks[5])
+
+
+def lstart_comm(pid):
+    """(start epoch, comm) for a running pid; None when ps reports no such process.
+    Raises ProcsError when ps itself failed."""
+    rc, out = _run_rc(["ps", "-o", "lstart=,comm=", "-p", str(pid)])
+    if rc != 0 and not out.strip():
+        return None
+    ent = parse_lstart_comm(out)
+    if ent is None:
+        raise ProcsError("unparseable ps output for pid %s" % pid)
+    return ent
+
+
+NON_INTERACTIVE_FLAGS = ("-p", "--print", "--sdk-url")
 
 
 def is_interactive_command(cmd):
-    """False when the claude argv carries -p / --print (a headless one-shot run)."""
+    """False for headless runs: -p/--print, --sdk-url, or stream-json input/output."""
     if not cmd:
         return True
-    for tok in cmd.split()[1:]:
-        if tok in ("-p", "--print") or tok.startswith("--print="):
+    toks = cmd.split()[1:]
+    for i, tok in enumerate(toks):
+        name, _, val = tok.partition("=")
+        if name in NON_INTERACTIVE_FLAGS:
             return False
+        if name in ("--input-format", "--output-format"):
+            v = val or (toks[i + 1] if i + 1 < len(toks) else "")
+            if v == "stream-json":
+                return False
     return True
 
 
-def pid_alive(pid):
+def pid_exists(pid):
+    """True / False / None (unknown). EPERM means it exists (another user's process)."""
     if not pid:
         return False
     try:
@@ -112,29 +163,70 @@ def pid_alive(pid):
     except PermissionError:
         return True
     except (OSError, ValueError, OverflowError):
-        return False
+        return None
     return True
 
 
-def identity_alive(pid, pid_start, lookup=None):
-    """True only when pid runs, is claude, and (when known) started at pid_start.
-    `lookup(pid) -> (lstart, comm) | None` is injectable for tests."""
+def pid_alive(pid):
+    return bool(pid_exists(pid))
+
+
+def identity_probe(pid, pid_start, lookup=None, exists=None, want_claude=True):
+    """ALIVE | GONE | UNKNOWN for the exact process (pid, start epoch).
+    GONE only when the pid is absent (ESRCH) or now belongs to another process; a ps
+    failure or a race is UNKNOWN. A row without a start time cannot be identified: UNKNOWN."""
     if not pid:
-        return False
+        return GONE
+    if pid_start is None:
+        return UNKNOWN
     pid = int(pid)
-    if lookup is None:
-        if not pid_alive(pid):
-            return False
-        lookup = lstart_comm
-    ent = lookup(pid)
+    exists = exists or pid_exists
+    e = exists(pid)
+    if e is False:
+        return GONE
+    if e is None:
+        return UNKNOWN
+    try:
+        ent = (lookup or lstart_comm)(pid)
+    except ProcsError:
+        return UNKNOWN
     if ent is None:
+        e2 = exists(pid)
+        return GONE if e2 is False else UNKNOWN
+    start, comm = ent
+    if want_claude and not is_claude_comm(comm):
+        return GONE
+    try:
+        same = int(start) == int(pid_start)
+    except (TypeError, ValueError):
+        return UNKNOWN
+    return ALIVE if same else GONE
+
+
+def identity_alive(pid, pid_start, lookup=None, exists=None):
+    """True only when pid runs, is claude, and started at pid_start. A missing start time
+    is never alive-for-row (R1)."""
+    if not pid or pid_start is None:
         return False
-    lstart, comm = ent
-    if not is_claude_comm(comm):
-        return False
-    if pid_start and lstart != pid_start:
-        return False
-    return True
+    if lookup is not None and exists is None:
+        exists = lambda p: True  # noqa: E731 - test lookups stand in for the process table
+    return identity_probe(pid, pid_start, lookup=lookup, exists=exists) == ALIVE
+
+
+def child_identities(pid):
+    """[(child pid, start epoch)] for the direct children of pid, read before a kill."""
+    out = _run(["ps", "-axo", "pid=,ppid="])
+    kids = []
+    for line in (out or "").splitlines():
+        p = line.split()
+        if len(p) == 2 and p[1] == str(pid):
+            try:
+                ent = lstart_comm(int(p[0]))
+            except (ProcsError, ValueError):
+                continue
+            if ent:
+                kids.append((int(p[0]), ent[0]))
+    return kids
 
 
 def ps_commands():
