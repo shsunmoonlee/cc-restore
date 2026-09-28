@@ -515,13 +515,20 @@ class Fix13Restore(TempEnv):
 
     def test_fix15_retyped_rows_are_not_retyped_next_boot(self):
         self.insert(session_id="h", state="hibernated", iterm_guid="G1", pid=None, last_event_at=900)
-        ledger.mark_restored(self.conn, "h", "G-new")
+        ledger.mark_restored(self.conn, "h", "G-new", now=1050)
         r = ledger.get(self.conn, "h")
         self.assertEqual(r["iterm_guid"], "G-new")
+        # restored this boot and the replacement tab is live: skip
         run, typed, skipped = restore.select([r], 1000, 1100, self.cfg, lambda r: False, auto=True,
-                                             live_guids=set())
+                                             live_guids={"G-new"})
         self.assertEqual(typed, [])
         self.assertIn("already retyped", skipped[0][1])
+        # round 2: replacement tab gone -> retype
+        run, typed, _ = restore.select([r], 1000, 1100, self.cfg, lambda r: False, auto=True, live_guids=set())
+        self.assertEqual([t["session_id"] for t in typed], ["h"])
+        # round 2: restored during an earlier boot -> not a reason to skip
+        run, typed, _ = restore.select([r], 1060, 1100, self.cfg, lambda r: False, auto=True, live_guids=set())
+        self.assertEqual([t["session_id"] for t in typed], ["h"])
 
     def test_osascript_returns_session_ids(self):
         lines = restore.osascript_for([("a", True), ("b", False)])

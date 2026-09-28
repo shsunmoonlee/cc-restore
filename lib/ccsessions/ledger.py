@@ -12,15 +12,22 @@ import time
 from . import (BUSY, ENDED, EVICTING, HIBERNATED, IDLE, PARKED_STATES, RESUMING,
                SCHEMA_VERSION, SUPERSEDED, WAITING)
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS sessions(
+V1_COLUMNS = ("session_id, pid, interactive, tty, cwd, launch_cwd, transcript, title, state, "
+              "state_since, last_event, last_event_at, subagents, started_at, ended_at, "
+              "end_reason, source, iterm_guid, last_focus_at, resumed_at, evicted_at")
+
+SESSIONS_TABLE = """
+CREATE TABLE sessions(
   session_id TEXT PRIMARY KEY, pid INTEGER, pid_start INTEGER, interactive INTEGER DEFAULT 1,
   tty TEXT, cwd TEXT, launch_cwd TEXT, transcript TEXT, title TEXT,
   state TEXT, state_since REAL, last_event TEXT, last_event_at REAL,
   subagents INTEGER DEFAULT 0, started_at REAL, ended_at REAL, end_reason TEXT,
   source TEXT, iterm_guid TEXT, last_focus_at REAL, resumed_at REAL, evicted_at REAL,
-  held_state TEXT, restored_at REAL);
-CREATE INDEX IF NOT EXISTS sessions_pid ON sessions(pid, pid_start);
+  held_state TEXT, restored_at REAL)"""
+
+SESSIONS_INDEX = "CREATE INDEX IF NOT EXISTS sessions_pid ON sessions(pid, pid_start)"
+
+SCHEMA = SESSIONS_TABLE + ";\n" + SESSIONS_INDEX + """;
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, session_id TEXT,
   event TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
@@ -61,12 +68,33 @@ def connect(path, readonly=False):
     if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
         conn.execute("PRAGMA journal_mode=WAL")
         with tx(conn):
-            if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
+            v = conn.execute("PRAGMA user_version").fetchone()[0]
+            if v == 0:
                 for stmt in SCHEMA.strip().split(";"):
                     if stmt.strip():
                         conn.execute(stmt)
-                conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+            elif v == 1:
+                migrate_v1_to_v2(conn)
+            elif v != SCHEMA_VERSION:
+                raise LedgerError("ledger schema %s is newer than this code (%s)" % (v, SCHEMA_VERSION))
+            conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     return conn
+
+
+def migrate_v1_to_v2(conn):
+    """v1 -> v2 inside the caller's transaction: add held_state + restored_at and give
+    pid_start INTEGER affinity (a table rebuild: ALTER cannot change a column's type).
+    A pid_start that is not a plain integer (v1 stored the ps lstart text) becomes NULL,
+    which makes the row's identity 'unknown': never evicted, never treated as alive."""
+    conn.execute("ALTER TABLE sessions RENAME TO sessions_v1")
+    conn.execute(SESSIONS_TABLE)
+    conn.execute("INSERT INTO sessions(%s, pid_start) SELECT %s, CASE "
+                 "WHEN typeof(pid_start)='integer' THEN pid_start "
+                 "WHEN typeof(pid_start)='text' AND pid_start<>'' AND pid_start NOT GLOB '*[^0-9]*' "
+                 "THEN CAST(pid_start AS INTEGER) ELSE NULL END FROM sessions_v1"
+                 % (V1_COLUMNS, V1_COLUMNS))
+    conn.execute("DROP TABLE sessions_v1")
+    conn.execute(SESSIONS_INDEX)
 
 
 @contextlib.contextmanager
@@ -142,6 +170,7 @@ def apply_event(conn, event, payload, proc, now=None):
             detail["source"] = src
             fields["ended_at"] = None
             fields["end_reason"] = None
+            fields["restored_at"] = None
             if src in ("startup", "clear", "resume"):
                 fields["subagents"] = 0
             if src in ("startup", "clear"):
@@ -273,8 +302,8 @@ def begin_eviction(conn, row, free, rss, now=None):
     now = time.time() if now is None else now
     with tx(conn):
         cur = conn.execute(
-            "UPDATE sessions SET state=?, state_since=?, evicted_at=? WHERE session_id=? AND "
-            "state=? AND last_event_at IS ?",
+            "UPDATE sessions SET state=?, state_since=?, evicted_at=?, restored_at=NULL WHERE "
+            "session_id=? AND state=? AND last_event_at IS ?",
             (EVICTING, now, now, row["session_id"], row["state"], row["last_event_at"]))
         if cur.rowcount != 1:
             return None
@@ -311,8 +340,8 @@ def mark_hibernated(conn, sid, now=None, only_from=(EVICTING,)):
     now = time.time() if now is None else now
     with tx(conn):
         q = ",".join("?" * len(only_from))
-        cur = conn.execute("UPDATE sessions SET state=?, state_since=? WHERE session_id=? AND "
-                           "state IN (%s)" % q, (HIBERNATED, now, sid) + tuple(only_from))
+        cur = conn.execute("UPDATE sessions SET state=?, state_since=?, held_state=NULL WHERE "
+                           "session_id=? AND state IN (%s)" % q, (HIBERNATED, now, sid) + tuple(only_from))
         return cur.rowcount
 
 

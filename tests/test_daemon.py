@@ -421,8 +421,8 @@ class Lifecycle(TempEnv):
         self.insert(session_id="b", state="resuming")
         self.insert(session_id="c", state="evicting", pid=222)
         fixed = D.reconcile(self.conn, lambda r: r["pid"] == 222)
-        self.assertEqual(sorted(fixed), [("a", "evicting", "hibernated"), ("b", "resuming", "hibernated"),
-                                         ("c", "evicting", "idle")])
+        self.assertEqual(sorted(fixed), [("a", "evicting", "hibernated"), ("c", "evicting", "idle")])
+        self.assertEqual(ledger.state_of(self.conn, "b"), "resuming")  # expire_resuming owns it
 
     def test_R10_resuming_times_out(self):
         now = time.time()

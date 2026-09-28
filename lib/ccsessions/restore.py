@@ -11,6 +11,7 @@ restored. Hibernated rows are left alone unless --include-hibernated, or --auto 
 their tab gone; those tabs get the resume command typed but not run.
 """
 import os
+import re
 import subprocess
 import time
 
@@ -68,11 +69,12 @@ def select(rows, boot, now, cfg, alive_fn, auto=False, include_hibernated=False,
             elif not auto:
                 skipped.append((r, "hibernated"))
                 continue
-            elif r.get("restored_at"):
-                skipped.append((r, "hibernated (already retyped into a tab)"))
-                continue
             elif live_guids is None:
                 skipped.append((r, BLIND))
+                continue
+            elif r.get("restored_at") and boot and r["restored_at"] >= boot \
+                    and r.get("iterm_guid") in live_guids:
+                skipped.append((r, "hibernated (already retyped into a tab this boot)"))
                 continue
             elif r.get("iterm_guid") and r["iterm_guid"] not in live_guids:
                 bucket = typed
@@ -119,6 +121,17 @@ def osascript_for(tabs):
                   "delay 0.4"]
     lines += ["end tell", "return o"]
     return lines
+
+
+GUID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{7,}$")
+
+
+def valid_guids(stdout, n):
+    """Exactly n distinct, well-formed session ids (one per created tab), else None."""
+    ids = [l.strip() for l in (stdout or "").splitlines() if l.strip()]
+    if len(ids) != n or len(set(ids)) != n or not all(GUID_RE.match(i) for i in ids):
+        return None
+    return ids
 
 
 def iterm_guids():
@@ -190,11 +203,14 @@ def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=Fal
     for l in osascript_for(tabs):
         args += ["-e", l]
     r = subprocess.run(args, check=True, capture_output=True, text=True)
-    guids = [g.strip() for g in r.stdout.splitlines() if g.strip()]
+    guids = valid_guids(r.stdout, len(tabs))
+    if guids is None:
+        out("iTerm2 did not return one session id per new tab; typed rows stay retryable and "
+            "the boot marker is not written")
+        return 0
     from .ledger import mark_restored
     for i, row in enumerate(typed):
-        g = guids[len(runs) + i] if len(guids) == len(tabs) else None
-        mark_restored(conn, row["session_id"], g)
+        mark_restored(conn, row["session_id"], guids[len(runs) + i])
     if not blind:
         write_mark()
     out("opened %d tabs." % len(tabs))

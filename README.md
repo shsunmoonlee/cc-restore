@@ -53,6 +53,11 @@ work in flight (async agents, background shells, monitors, queued input, a sched
 wakeup, a usage-limit wait), and no child process other than MCP helpers. Candidates go in
 order of least recent focus, then largest memory.
 
+"Visible" deliberately means every pane of the current tab of every iTerm2 window,
+including minimized windows and windows on other Spaces: the daemon cannot tell whether
+you are looking at a window, so it treats every window's front tab as seen. This is
+conservative (such a tab is never evicted, and counts as seen on every tick).
+
 Eviction: compare-and-set the row to `evicting`, re-check the guards, SIGTERM, SIGKILL only
 after `term_grace_s` (15 s, logged as an INCIDENT). The tab gets a banner, the title
 `[zz] <title>`, and the resume command typed but not run. Focusing that tab later runs it.

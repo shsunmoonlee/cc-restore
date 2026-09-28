@@ -52,6 +52,8 @@ REAP_EVERY_S = 3600
 PRUNE_EVERY_S = 3600
 ON_EVICT_TIMEOUT_S = 30
 MAX_ABORTS_PER_PASS = 3
+ITERM_CALL_TIMEOUT_S = 5
+CANCEL_WAIT_S = 5
 TTY_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
              "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[<u\x1b[?7h\x1b[0m\x1b>")
 
@@ -179,6 +181,15 @@ def is_shell_job(job):
 
 class ConnectionLost(Exception):
     """The iTerm2 connection is gone or unresponsive: leave the loops and reconnect."""
+
+
+async def iterm_call(aw, what):
+    """Every iTerm2 await outside the focus snapshot goes through here: an unanswered call
+    is a dead connection, not something to wait on forever."""
+    try:
+        return await asyncio.wait_for(aw, ITERM_CALL_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise ConnectionLost("iTerm2 did not answer %s within %ss" % (what, ITERM_CALL_TIMEOUT_S))
 
 
 def connection_alive(connection):
@@ -372,6 +383,10 @@ class Evictor(object):
             kids = list(await self._call(self.children, row) or [])
         except Exception:
             kids = []
+        why = self.final_check(row)  # synchronous: nothing can interleave before the signal
+        if why:
+            self._abort(row, eid, why)
+            return "aborted-final"
         try:
             self.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -422,13 +437,40 @@ class Evictor(object):
                                detail=None if st == HIBERNATED else "row ended as %s" % st)
         log.info("evicted %s (%s) free=%s%% rss=%.0fMB", sid[:8], outcome, free, rss_mb or 0)
         title = title or row.get("title") or sid[:8]
+        lost = None
         if st == HIBERNATED:
             try:
                 await self.prepare_tab(row, title)
+            except ConnectionLost as exc:
+                lost = exc
+                log.warning("evict %s: iTerm2 stopped answering while preparing the tab", sid[:8])
             except Exception:
                 log.exception("evict %s: preparing the tab failed", sid[:8])
         self.run_on_evict(row, title, outcome)
+        if lost is not None:
+            raise lost
         return outcome
+
+    def final_check(self, row):
+        """Re-read the row and the registry immediately before SIGTERM."""
+        sid = row["session_id"]
+        fresh = ledger.get(self.conn, sid)
+        if not fresh or fresh.get("state") != EVICTING:
+            return "row is %s before signal" % (fresh or {}).get("state")
+        if fresh.get("last_event_at") != row.get("last_event_at"):
+            return "hook activity during the checks"
+        if fresh.get("pid") != row.get("pid") or fresh.get("pid_start") != row.get("pid_start"):
+            return "row identity changed"
+        reg = os.path.join(self.cfg.path("claude_sessions"), "%s.json" % row["pid"])
+        if os.path.exists(reg):
+            try:
+                with open(reg) as fh:
+                    got = json.load(fh).get("sessionId")
+            except Exception:
+                return "registry file unreadable before signal"
+            if got != sid:
+                return "registry names another session before signal"
+        return None
 
     async def kill_children(self, sid, kids):
         for cpid, cstart in kids:
@@ -547,21 +589,22 @@ class Pressure(object):
 
 
 def reconcile(conn, probes, now=None, min_age_s=0.0):
-    """Rows left in evicting/resuming (daemon restart, crash, an eviction that could not
-    confirm its kill). probes: {session_id: ALIVE|GONE|UNKNOWN} (bools accepted) or a
-    callable(row). Alive -> back to the state a hook recorded (else idle); gone ->
-    hibernated; unknown -> left alone."""
+    """Rows left evicting (daemon restart, crash, an eviction that could not confirm its
+    kill). Resuming rows belong to expire_resuming. probes: {session_id: ALIVE|GONE|UNKNOWN}
+    (bools accepted) or a callable(row). Alive -> the state a hook recorded (else idle) and
+    evicted_at cleared, so a later SessionEnd(other) is an exit; gone -> hibernated;
+    unknown -> left alone."""
     now = time.time() if now is None else now
     fixed = []
-    for r in ledger.all_rows(conn, "state IN (?,?) AND COALESCE(state_since, 0) <= ?",
-                             (EVICTING, RESUMING, now - min_age_s)):
+    for r in ledger.all_rows(conn, "state=? AND COALESCE(state_since, 0) <= ?",
+                             (EVICTING, now - min_age_s)):
         st = _as_state(probes(r) if callable(probes) else probes.get(r["session_id"], procs.UNKNOWN))
         if st == procs.UNKNOWN:
             continue
         with ledger.tx(conn):
             if st == procs.ALIVE:
                 conn.execute("UPDATE sessions SET state=COALESCE(held_state, ?), held_state=NULL, "
-                             "state_since=? WHERE session_id=? AND state=?",
+                             "evicted_at=NULL, state_since=? WHERE session_id=? AND state=?",
                              (IDLE, now, r["session_id"], r["state"]))
             else:
                 conn.execute("UPDATE sessions SET state=?, held_state=NULL, state_since=? WHERE "
@@ -632,11 +675,11 @@ class ItermTabs(object):
         s = self._s(guid)
         if s is None:
             return None
-        return (await s.async_get_variable("jobName")) or ""
+        return (await iterm_call(s.async_get_variable("jobName"), "jobName")) or ""
 
     async def tty(self, guid):
         s = self._s(guid)
-        return (await s.async_get_variable("tty")) if s is not None else None
+        return (await iterm_call(s.async_get_variable("tty"), "tty")) if s is not None else None
 
     async def is_visible(self, guid):
         for w in self.app.terminal_windows:
@@ -648,28 +691,28 @@ class ItermTabs(object):
     async def inject(self, guid, data):
         s = self._s(guid)
         if s is not None:
-            await s.async_inject(data)
+            await iterm_call(s.async_inject(data), "inject")
 
     async def set_name(self, guid, name):
         s = self._s(guid)
         if s is not None:
-            await s.async_set_name(name)
+            await iterm_call(s.async_set_name(name), "set_name")
 
     async def send_text(self, guid, text):
         s = self._s(guid)
         if s is not None:
-            await s.async_send_text(text)
+            await iterm_call(s.async_send_text(text), "send_text")
 
     async def new_tab(self, text):
         import iterm2
         w = self.app.current_terminal_window
         if w is None:
-            w = await iterm2.Window.async_create(self.connection)
+            w = await iterm_call(iterm2.Window.async_create(self.connection), "create window")
             s = w.current_tab.current_session
         else:
-            t = await w.async_create_tab()
+            t = await iterm_call(w.async_create_tab(), "create tab")
             s = t.current_session
-        await s.async_send_text(text)
+        await iterm_call(s.async_send_text(text), "send_text")
         return s.session_id
 
 
@@ -944,7 +987,7 @@ class Daemon(object):
         if session is None:
             return
         guid = session.session_id
-        tty = procs.norm_tty(await session.async_get_variable("tty"))
+        tty = procs.norm_tty(await iterm_call(session.async_get_variable("tty"), "tty"))
         if not tty:
             return
         now = time.time()
@@ -963,7 +1006,7 @@ class Daemon(object):
             return
         hib.sort(key=lambda r: r.get("evicted_at") or 0, reverse=True)
         row = hib[0]
-        job = (await session.async_get_variable("jobName")) or ""
+        job = (await iterm_call(session.async_get_variable("jobName"), "jobName")) or ""
         gone = await self.identity(row) == procs.GONE
         why = resume_decision(row, guid, tty, now, self.last_fire, job, lambda r: not gone)
         if why:
@@ -976,8 +1019,9 @@ class Daemon(object):
             log.info("DRY RUN would resume %s on focus", row["session_id"][:8])
             return
         ledger.mark_resuming(self.conn, row["session_id"], now)
-        await session.async_send_text("\x15" + resumecmd.command(self.cfg, row["session_id"], row.get("cwd")) + "\r")
-        await session.async_set_name(row.get("title") or row["session_id"][:8])
+        await iterm_call(session.async_send_text(
+            "\x15" + resumecmd.command(self.cfg, row["session_id"], row.get("cwd")) + "\r"), "send_text")
+        await iterm_call(session.async_set_name(row.get("title") or row["session_id"][:8]), "set_name")
         log.info("resumed %s on focus (%s)", row["session_id"][:8], tty)
 
     async def focus_loop(self):
@@ -1014,10 +1058,15 @@ class Daemon(object):
             for t in tasks:
                 if not t.done():
                     t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # bounded: FocusMonitor's unsubscribe can wait forever on a dead dispatcher
+            await asyncio.wait(tasks, timeout=CANCEL_WAIT_S)
         for t in done:
             if not t.cancelled() and t.exception() is not None:
                 raise t.exception()
+        stuck = [t for t in tasks if not t.done()]
+        if stuck:
+            log.warning("%d loop(s) did not finish cancelling within %ss; reconnecting anyway",
+                        len(stuck), CANCEL_WAIT_S)
         raise ConnectionLost("daemon loops ended")
 
 
@@ -1111,7 +1160,7 @@ def main(argv=None):
         log.info("another daemon holds the lock; exiting")
         return 0
     conn = ledger.connect(cfg.path("db"))
-    fixed = reconcile(conn, probe_rows(ledger.all_rows(conn, "state IN (?,?)", (EVICTING, RESUMING))))
+    fixed = reconcile(conn, probe_rows(ledger.all_rows(conn, "state=?", (EVICTING,))))
     for sid, old, new in fixed:
         log.info("startup: %s %s -> %s", sid[:8], old, new)
     log.info("daemon start (dry_run=%s, pid %d)", dry_run, os.getpid())
