@@ -130,19 +130,21 @@ class Policy(TempEnv):
     def test_R1_identity_checks_registry(self):
         chk = D.default_identity(self.cfg)
         self.assertEqual(chk({"session_id": "s1", "pid": 10, "pid_start": None}), "no recorded process start time")
-        orig = D.procs.identity_alive
-        D.procs.identity_alive = lambda pid, start, lookup=None: False
+        orig = D.procs.identity_probe
         try:
-            self.assertEqual(chk({"session_id": "s1", "pid": 10, "pid_start": "x"}), "process gone or pid reused")
+            D.procs.identity_probe = lambda pid, start, **kw: D.procs.GONE
+            self.assertEqual(chk({"session_id": "s1", "pid": 10, "pid_start": 5}), "process gone or pid reused")
+            D.procs.identity_probe = lambda pid, start, **kw: D.procs.UNKNOWN
+            self.assertEqual(chk({"session_id": "s1", "pid": 10, "pid_start": 5}), "process identity unknown")
         finally:
-            D.procs.identity_alive = orig
+            D.procs.identity_probe = orig
 
     def test_R1_registry_mismatch_keeps(self):
         os.makedirs(self.cfg.path("claude_sessions"))
         with open(os.path.join(self.cfg.path("claude_sessions"), "10.json"), "w") as fh:
             json.dump({"sessionId": "other"}, fh)
-        orig = D.procs.identity_alive
-        D.procs.identity_alive = lambda pid, start, lookup=None: True
+        orig = D.procs.identity_probe
+        D.procs.identity_probe = lambda pid, start, **kw: D.procs.ALIVE
         try:
             chk = D.default_identity(self.cfg)
             self.assertEqual(chk({"session_id": "s1", "pid": 10, "pid_start": "x"}), "registry names another session")
@@ -153,7 +155,7 @@ class Policy(TempEnv):
                 json.dump({"sessionId": "s1"}, fh)
             self.assertIsNone(chk({"session_id": "s1", "pid": 10, "pid_start": "x"}))
         finally:
-            D.procs.identity_alive = orig
+            D.procs.identity_probe = orig
 
     def test_R3_activity_sources(self):
         act = D.default_activity(self.cfg)
@@ -194,19 +196,28 @@ class ResumeDecision(TempEnv):
         self.assertEqual(D.resume_decision(hib, "G1", "ttys001", now, {}, "zsh", lambda r: True), "already running")
         self.assertEqual(D.resume_decision(dict(hib, state="idle"), "G1", "ttys001", now, {}, "zsh", alive), "state=idle")
 
-    def test_unguided_rows_need_tty_and_recent_eviction(self):
+    def test_fix19_rows_without_guid_never_resume_on_focus(self):
         now, alive = NOW, (lambda r: False)
-        imp = {"state": "hibernated", "iterm_guid": None, "tty": "ttys001", "evicted_at": now - 3600}
-        self.assertIsNone(D.resume_decision(imp, "G9", "ttys001", now, {}, "zsh", alive))
-        self.assertEqual(D.resume_decision(imp, "G9", "ttys002", now, {}, "zsh", alive), "tty mismatch")
-        old = dict(imp, evicted_at=now - 2 * 86400)
-        self.assertIn("over a day", D.resume_decision(old, "G9", "ttys001", now, {}, "zsh", alive))
+        imp = {"state": "hibernated", "iterm_guid": None, "tty": "ttys001", "evicted_at": now - 60}
+        self.assertIn("cc-sessions wake", D.resume_decision(imp, "G9", "ttys001", now, {}, "zsh", alive))
+
+    def test_fix14_non_interactive_never_resumes(self):
+        row = {"state": "hibernated", "iterm_guid": "G1", "tty": "ttys001", "interactive": 0}
+        self.assertEqual(D.resume_decision(row, "G1", "ttys001", NOW, {}, "zsh", lambda r: False),
+                         "non-interactive")
 
 
 class FakeTabs(object):
-    def __init__(self, jobs):
+    def __init__(self, jobs, tty="ttys001", visible=False):
         self.jobs = list(jobs)
         self.calls = []
+        self.tty_now, self.visible_now = tty, visible
+
+    async def tty(self, guid):
+        return "/dev/" + self.tty_now if self.tty_now else None
+
+    async def is_visible(self, guid):
+        return self.visible_now
 
     async def job_name(self, guid):
         self.calls.append(("job", guid))
@@ -241,12 +252,14 @@ class Eviction(TempEnv):
                                cwd="/w/it's here", title="Title")
         self.kills = []
         self.alive = True
+        self.kids, self.kid_state = [], {}
 
     def evictor(self, tabs, on_evict=None, identity=None):
         def kill(pid, sig):
             self.kills.append((pid, sig))
         return D.Evictor(self.conn, self.cfg, tabs, kill=kill, identity=identity or (lambda r: self.alive),
-                         clock=self.clock, sleep=self.clock.sleep, on_evict=on_evict)
+                         clock=self.clock, sleep=self.clock.sleep, on_evict=on_evict,
+                         children=lambda r: list(self.kids), child_probe=lambda p, s: self.kid_state.get(p, "gone"))
 
     def arun(self, coro):
         loop = asyncio.new_event_loop()
@@ -285,9 +298,19 @@ class Eviction(TempEnv):
 
     def test_sigkill_escalation_is_an_incident(self):
         tabs = FakeTabs(["zsh"])
-        out = self.arun(self.evictor(tabs).evict(self.row, 12, 1.0))
+        ev = self.evictor(tabs)
+
+        def kill(pid, sig):
+            self.kills.append((pid, sig))
+            if sig == signal.SIGKILL and pid == 111:
+                self.alive = False
+        ev.kill = kill
+        self.kids = [(501, 9001), (502, 9002)]
+        self.kid_state = {501: "alive", 502: "gone"}
+        out = self.arun(ev.evict(self.row, 12, 1.0))
         self.assertEqual(out, "killed")
-        self.assertEqual([k[1] for k in self.kills], [signal.SIGTERM, signal.SIGKILL])
+        # fix 20: only the captured child whose identity is still alive is SIGKILLed
+        self.assertEqual(self.kills, [(111, signal.SIGTERM), (111, signal.SIGKILL), (501, signal.SIGKILL)])
         self.assertGreaterEqual(self.clock.t - NOW, self.cfg["term_grace_s"])
         self.assertEqual(ledger.state_of(self.conn, "s1"), "hibernated")
         self.assertEqual(self.conn.execute("SELECT outcome FROM evictions").fetchone()[0], "killed")
@@ -304,6 +327,7 @@ class Eviction(TempEnv):
         out = self.arun(self.evictor(FakeTabs(["zsh"])).evict(self.row, 12, 1.0, recheck=lambda r: "visible tab"))
         self.assertEqual(out, "aborted-recheck")
         self.assertEqual(self.kills, [])
+        self.assertEqual(ledger.state_of(self.conn, "s1"), "idle")
 
         async def arecheck(r):
             return "running: make"
@@ -483,7 +507,11 @@ class ItermSide(TempEnv):
 
     def daemon(self, dry_run=False):
         d = D.Daemon(self.cfg, self.conn, FakeApp([]), None, dry_run)
-        d.identity = lambda r: r.get("state") in ("idle", "busy") and r.get("pid") == 111
+
+        async def ident(r):
+            ok = r.get("state") in ("idle", "busy") and r.get("pid") == 111
+            return D.procs.ALIVE if ok else D.procs.GONE
+        d.identity = ident
         return d
 
     def test_focus_on_live_session_records_focus(self):

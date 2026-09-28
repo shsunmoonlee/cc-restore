@@ -36,17 +36,44 @@ class Procs(TempEnv):
 
     def test_proc_info_parse(self):
         info = procs.parse_proc_info("Mon Sep 28 12:00:16 2026     ttys004  claude --resume x\n")
-        self.assertEqual(info, {"pid_start": "Mon Sep 28 12:00:16 2026", "tty": "ttys004",
-                                "command": "claude --resume x"})
+        self.assertEqual(info, {"pid_start": 1790596816, "tty": "ttys004", "command": "claude --resume x"})
         self.assertIsNone(procs.parse_proc_info(""))
 
     def test_R1_identity_uses_start_time(self):
-        lk = lambda pid: ("Mon Sep 28 12:00:16 2026", "claude")
-        self.assertTrue(procs.identity_alive(5, "Mon Sep 28 12:00:16 2026", lookup=lk))
-        self.assertFalse(procs.identity_alive(5, "Sun Sep 27 12:00:16 2026", lookup=lk))
-        self.assertFalse(procs.identity_alive(5, None, lookup=lambda pid: ("x", "node")))
-        self.assertFalse(procs.identity_alive(5, "x", lookup=lambda pid: None))
-        self.assertFalse(procs.identity_alive(None, "x", lookup=lk))
+        lk = lambda pid: (1000, "claude")
+        self.assertTrue(procs.identity_alive(5, 1000, lookup=lk))
+        self.assertFalse(procs.identity_alive(5, 999, lookup=lk))
+        self.assertFalse(procs.identity_alive(5, 1000, lookup=lambda pid: (1000, "node")))
+        self.assertFalse(procs.identity_alive(None, 1000, lookup=lk))
+
+    def test_fix6_missing_start_is_never_alive(self):
+        self.assertFalse(procs.identity_alive(5, None, lookup=lambda pid: (1000, "claude")))
+        self.assertEqual(procs.identity_probe(5, None, lookup=lambda p: (1, "claude"), exists=lambda p: True),
+                         procs.UNKNOWN)
+
+    def test_fix4_tri_state_probe(self):
+        ok = lambda p: (1000, "claude")
+        self.assertEqual(procs.identity_probe(5, 1000, lookup=ok, exists=lambda p: True), procs.ALIVE)
+        self.assertEqual(procs.identity_probe(5, 1000, lookup=ok, exists=lambda p: False), procs.GONE)
+        self.assertEqual(procs.identity_probe(5, 1000, lookup=ok, exists=lambda p: None), procs.UNKNOWN)
+
+        def boom(p):
+            raise procs.ProcsError("ps timed out")
+        self.assertEqual(procs.identity_probe(5, 1000, lookup=boom, exists=lambda p: True), procs.UNKNOWN)
+        # ps shows nothing but the pid still exists: a race, not proof of absence
+        self.assertEqual(procs.identity_probe(5, 1000, lookup=lambda p: None, exists=lambda p: True), procs.UNKNOWN)
+        self.assertEqual(procs.identity_probe(5, 999, lookup=ok, exists=lambda p: True), procs.GONE)
+
+    def test_fix7_start_time_is_utc_epoch(self):
+        self.assertEqual(procs.PS_ENV["TZ"], "UTC0")
+        self.assertEqual(procs.lstart_epoch("Thu Jan  1 00:00:10 1970".split()), 10)
+        self.assertIsNone(procs.lstart_epoch(["garbage"]))
+
+    def test_fix17_stream_json_and_sdk_url_are_headless(self):
+        for cmd in ("claude --output-format stream-json", "claude --input-format=stream-json",
+                    "claude --sdk-url ws://x", "claude --sdk-url=ws://x"):
+            self.assertFalse(procs.is_interactive_command(cmd), cmd)
+        self.assertTrue(procs.is_interactive_command("claude --output-format text"))
 
     def test_memory_and_boot_parsers(self):
         self.assertEqual(procs.parse_memory_pressure(
