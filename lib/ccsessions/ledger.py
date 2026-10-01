@@ -4,8 +4,10 @@ One writer per fact: hooks write session state; the daemon writes focus, evictio
 requests and the heartbeat. Every write is a short BEGIN IMMEDIATE transaction.
 """
 import contextlib
+import glob
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -43,8 +45,54 @@ EVICTIONS_KEEP_S = 90 * 86400
 SESSION_END_HIBERNATE_WINDOW_S = 60
 
 
+SID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
 class LedgerError(Exception):
     pass
+
+
+def resolve_transcript(projects, sid, recorded, stale_s=600, now=None):
+    """The transcript file of session `sid`: `recorded` when it is a regular file modified
+    within `stale_s`, else the newest by mtime of `recorded` (when a file) and every
+    <projects>/*/<sid>.jsonl (a session resumed from another cwd is reported under the new
+    cwd's project dir but keeps appending in the one it was created in), else None.
+    Only a UUID-shaped sid is searched for, and only one directory level deep."""
+    best, best_m = None, None
+    if recorded and os.path.isfile(recorded):
+        try:
+            best_m = os.path.getmtime(recorded)
+        except OSError:
+            best_m = None
+        if best_m is not None:
+            best = recorded
+            now = time.time() if now is None else now
+            if now - best_m < float(stale_s):
+                return recorded
+    if not projects or not isinstance(sid, str) or not SID_RE.match(sid):
+        return best
+    for p in glob.glob(os.path.join(glob.escape(projects), "*", sid + ".jsonl")):
+        try:
+            if not os.path.isfile(p):
+                continue
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if best_m is None or m > best_m:
+            best, best_m = p, m
+    return best
+
+
+def heal_transcript(conn, sid, old, new):
+    """Best effort: point the row at the transcript the resolver found, unless a hook
+    changed the column meanwhile. -> rows updated (0 on any SQLite error)."""
+    try:
+        with tx(conn):
+            cur = conn.execute("UPDATE sessions SET transcript=? WHERE session_id=? AND "
+                               "transcript IS ?", (new, sid, old))
+            return cur.rowcount
+    except sqlite3.Error:
+        return 0
 
 
 def connect(path, readonly=False):
@@ -132,13 +180,21 @@ def _set_state(fields, row, new_state, now):
         fields["state_since"] = now
 
 
-def apply_event(conn, event, payload, proc, now=None):
+def apply_event(conn, event, payload, proc, now=None, projects=None):
     """Apply one hook event. `proc` is {pid, pid_start, tty, interactive} for the claude
-    process that fired the hook, or None when it could not be found. Returns the new row."""
+    process that fired the hook, or None when it could not be found. `projects` is the
+    Claude Code projects dir the transcript is looked up in when the payload's
+    transcript_path does not exist (default: that path's grandparent). Returns the new row."""
     now = time.time() if now is None else now
     sid = payload.get("session_id")
     if not sid or not isinstance(sid, str):
         raise ValueError("hook payload has no session_id")
+    tpath = payload.get("transcript_path")
+    if tpath and isinstance(tpath, str):
+        if projects is None:
+            projects = os.path.dirname(os.path.dirname(tpath))
+        # a brand-new session has no file yet: keep the payload path, later events re-resolve
+        tpath = resolve_transcript(projects, sid, tpath) or tpath
     with tx(conn):
         row = get(conn, sid)
         fields = {"last_event": event, "last_event_at": now, "source": "hook"}
@@ -154,8 +210,8 @@ def apply_event(conn, event, payload, proc, now=None):
             fields["cwd"] = payload["cwd"]
             if not row.get("launch_cwd"):
                 fields["launch_cwd"] = payload["cwd"]
-        if payload.get("transcript_path"):
-            fields["transcript"] = payload["transcript_path"]
+        if tpath:
+            fields["transcript"] = tpath
         if proc:
             fields["pid"] = proc.get("pid")
             fields["pid_start"] = proc.get("pid_start")

@@ -9,7 +9,9 @@ Needs a python with the `iterm2` package. The policy (`choose_candidates`) and t
 eviction sequence (`Evictor`) are plain Python, importable and testable without iterm2.
 
 Loop: every tick_s read free memory; below low_free_pct evict the best candidate, let it
-settle, re-read, and continue until high_free_pct or no candidate. Eviction is recorded
+settle, re-read, and continue until high_free_pct or no candidate (swap at or above
+swap_high_pct also starts this pass). With idle_hibernate_min > 0 each tick then also
+hibernates up to idle_hibernate_per_tick sessions idle that long. Eviction is recorded
 first (compare-and-set to 'evicting'), then SIGTERM, then SIGKILL after term_grace_s.
 Focusing a hibernated tab types the resume command into it.
 """
@@ -74,8 +76,44 @@ def _as_analysis(v):
     return {"pending": list(v or []), "has_user": True}
 
 
+def _projects(cfg):
+    if hasattr(cfg, "path"):
+        return cfg.path("claude_projects")
+    return config.expand(cfg.get("claude_projects"))
+
+
+def row_transcript(row, cfg):
+    """The row's transcript file (ledger.resolve_transcript), or None. When the resolver
+    finds a different file than the recorded one, row["transcript"] is replaced in this
+    dict; the event loop writes it back to the ledger (heal_transcripts)."""
+    rec = row.get("transcript")
+    tr = ledger.resolve_transcript(_projects(cfg), row.get("session_id"), rec,
+                                   stale_s=float(cfg.get("idle_min") or 10) * 60)
+    if tr and tr != rec:
+        row["transcript"] = tr
+    return tr
+
+
+def heal_transcripts(conn, rows, before):
+    """Write back the transcript paths the resolver corrected in `rows` (before: {sid: the
+    recorded path}). Best effort, skipped inside a transaction. -> [(sid, old, new)]."""
+    healed = []
+    if conn.in_transaction:
+        return healed
+    for r in rows:
+        sid = r["session_id"]
+        if sid not in before or r.get("transcript") == before[sid] or not r.get("transcript"):
+            continue
+        if ledger.heal_transcript(conn, sid, before[sid], r["transcript"]):
+            healed.append((sid, before[sid], r["transcript"]))
+            log.info("transcript of %s resolved to %s (recorded %s)", sid[:8], r["transcript"],
+                     before[sid])
+    return healed
+
+
 def guard_reason(row, now, cfg, focus_state, pending_fn, children_fn, identity_fn=None,
-                 activity_fn=None, evictions_today=None, hook_failed=None, explicit=False):
+                 activity_fn=None, evictions_today=None, hook_failed=None, explicit=False,
+                 status_fn=None):
     """Why this row must be kept, or None when it may be evicted. Cheap checks first; the
     transcript, file-activity and process-tree checks run only for rows that got that far."""
     sid = row["session_id"]
@@ -115,8 +153,11 @@ def guard_reason(row, now, cfg, focus_state, pending_fn, children_fn, identity_f
         why = identity_fn(row)
         if why:
             return why
-    tr = row.get("transcript")
-    if not tr or not os.path.isfile(tr):
+    if status_fn is not None:
+        why = status_fn(row)
+        if why:
+            return why
+    if not row_transcript(row, cfg):
         return "no transcript"
     if activity_fn is not None:
         newest = activity_fn(row)
@@ -144,12 +185,12 @@ def order_key(row, rss):
 
 def choose_candidates(rows, now, cfg, focus_state, rss, pending_fn, children_fn,
                       identity_fn=None, activity_fn=None, evictions_today=None,
-                      hook_failed=None, explicit=False):
+                      hook_failed=None, explicit=False, status_fn=None):
     """-> (candidates in eviction order, [(row, keep_reason)])."""
     cands, kept = [], []
     for r in rows:
         why = guard_reason(r, now, cfg, focus_state, pending_fn, children_fn, identity_fn,
-                           activity_fn, evictions_today, hook_failed, explicit)
+                           activity_fn, evictions_today, hook_failed, explicit, status_fn)
         if why:
             kept.append((r, why))
         else:
@@ -210,6 +251,49 @@ def connection_alive(connection):
 
 # ------------------------------------------------------------------ default fact sources
 
+REGISTRY_UNREADABLE = object()
+
+
+def read_registry(sessions_dir, pid):
+    """Claude Code's own session file <sessions_dir>/<pid>.json: None when it does not
+    exist, REGISTRY_UNREADABLE when it exists but is not a readable JSON object, else the
+    dict (sessionId, status idle|busy|waiting|shell, statusUpdatedAt, ...)."""
+    reg = os.path.join(sessions_dir, "%s.json" % pid)
+    if not os.path.exists(reg):
+        return None
+    try:
+        with open(reg) as fh:
+            d = json.load(fh)
+    except Exception:
+        return REGISTRY_UNREADABLE
+    return d if isinstance(d, dict) else REGISTRY_UNREADABLE
+
+
+def status_reason(d):
+    """Keep reason from Claude Code's own status (d: read_registry), or None. A missing
+    file (older Claude Code) or a file without a status changes nothing; a file that exists
+    but does not parse keeps the session (fail closed); any status but idle keeps it (busy,
+    waiting on a prompt or dialog, shell)."""
+    if d is None:
+        return None
+    if d is REGISTRY_UNREADABLE:
+        return "claude status file unreadable"
+    status = d.get("status")
+    if status is None or status == IDLE:
+        return None
+    return "claude status %s" % str(status)[:20]
+
+
+def default_status(cfg):
+    sessions_dir = cfg.path("claude_sessions")
+
+    def check(row):
+        if row.get("pid") is None:
+            return None
+        return status_reason(read_registry(sessions_dir, row["pid"]))
+    return check
+
+
 def default_identity(cfg):
     sessions_dir = cfg.path("claude_sessions")
 
@@ -219,15 +303,11 @@ def default_identity(cfg):
         st = procs.identity_probe(row.get("pid"), row["pid_start"])
         if st != procs.ALIVE:
             return "process gone or pid reused" if st == procs.GONE else "process identity unknown"
-        reg = os.path.join(sessions_dir, "%s.json" % row["pid"])
-        if os.path.exists(reg):
-            try:
-                with open(reg) as fh:
-                    got = json.load(fh).get("sessionId")
-            except Exception:
-                return "registry file unreadable"
-            if got != row["session_id"]:
-                return "registry names another session"
+        d = read_registry(sessions_dir, row["pid"])
+        if d is REGISTRY_UNREADABLE:
+            return "registry file unreadable"
+        if d is not None and d.get("sessionId") != row["session_id"]:
+            return "registry names another session"
         return None
     return check
 
@@ -236,12 +316,13 @@ def default_activity(cfg):
     tmp = cfg.path("claude_tmp")
 
     def newest(row):
-        sid, tr = row["session_id"], row.get("transcript")
+        sid, tr = row["session_id"], row_transcript(row, cfg)
         paths = []
         if tr:
             paths.append(tr)
             if tr.endswith(".jsonl"):
                 paths += glob.glob(tr[:-6] + "/subagents/*.jsonl")
+                paths += glob.glob(tr[:-6] + "/subagents/workflows/*/*.jsonl")
         paths += glob.glob(os.path.join(tmp, "*", sid, "tasks", "*"))
         best = None
         for p in paths:
@@ -273,7 +354,9 @@ class Facts(object):
     def analysis(self, row):
         sid = row["session_id"]
         if sid not in self._analysis:
-            self._analysis[sid] = pending.analyze(row.get("transcript"), self.now)
+            tr = row_transcript(row, self.cfg) or row.get("transcript")
+            self._analysis[sid] = pending.analyze(
+                tr, self.now, float(self.cfg.get("cron_recurring_block_h", 24)) * 3600)
         return self._analysis[sid]
 
     def children(self, row):
@@ -287,12 +370,15 @@ def compute_policy(cfg, focus_state, rows, evictions_today, explicit=False, now=
     """The slow half of a policy pass (ps, transcripts, registry, file stats). Touches no
     SQLite, so the daemon runs it in an executor thread. -> (cands, kept, rss, titles)."""
     now = time.time() if now is None else now
+    for r in rows:
+        row_transcript(r, cfg)  # heal every row, not only those that reach that guard
     facts = Facts(cfg, now)
     rss = facts.rss(rows)
     cands, kept = choose_candidates(
         rows, now, cfg, focus_state, rss, facts.analysis, facts.children,
         identity_fn=default_identity(cfg), activity_fn=default_activity(cfg),
-        evictions_today=evictions_today, hook_failed=hook_failed_sids(cfg), explicit=explicit)
+        evictions_today=evictions_today, hook_failed=hook_failed_sids(cfg), explicit=explicit,
+        status_fn=default_status(cfg))
     titles = {r["session_id"]: title_for(r, facts) for r in cands}
     return cands, kept, rss, titles
 
@@ -304,7 +390,10 @@ def live_rows(conn):
 def policy_pass(conn, cfg, focus_state, rows=None, explicit=False, now=None):
     now = time.time() if now is None else now
     rows = live_rows(conn) if rows is None else rows
-    return compute_policy(cfg, focus_state, rows, ledger.evictions_today(conn, now), explicit, now)
+    before = {r["session_id"]: r.get("transcript") for r in rows}
+    out = compute_policy(cfg, focus_state, rows, ledger.evictions_today(conn, now), explicit, now)
+    heal_transcripts(conn, rows, before)
+    return out
 
 
 def title_for(row, facts=None):
@@ -363,7 +452,7 @@ class Evictor(object):
         ledger.finish_eviction(self.conn, eid, "aborted", detail=why[:200])
         log.info("keep %s: %s (eviction rolled back, no signal sent)", row["session_id"][:8], why)
 
-    async def evict(self, row, free, rss_mb, recheck=None, title=None):
+    async def evict(self, row, free, rss_mb, recheck=None, title=None, reason=None):
         sid, pid = row["session_id"], int(row["pid"])
         eid = ledger.begin_eviction(self.conn, row, free, rss_mb, self.clock())
         if eid is None:
@@ -442,7 +531,8 @@ class Evictor(object):
         st = ledger.state_of(self.conn, sid)
         ledger.finish_eviction(self.conn, eid, outcome, signal=sig,
                                detail=None if st == HIBERNATED else "row ended as %s" % st)
-        log.info("evicted %s (%s) free=%s%% rss=%.0fMB", sid[:8], outcome, free, rss_mb or 0)
+        log.info("evicted %s (%s)%s free=%s%% rss=%.0fMB", sid[:8], outcome,
+                 " reason=%s" % reason if reason else "", free, rss_mb or 0)
         title = title or row.get("title") or sid[:8]
         lost = None
         if st == HIBERNATED:
@@ -468,15 +558,14 @@ class Evictor(object):
             return "hook activity during the checks"
         if fresh.get("pid") != row.get("pid") or fresh.get("pid_start") != row.get("pid_start"):
             return "row identity changed"
-        reg = os.path.join(self.cfg.path("claude_sessions"), "%s.json" % row["pid"])
-        if os.path.exists(reg):
-            try:
-                with open(reg) as fh:
-                    got = json.load(fh).get("sessionId")
-            except Exception:
-                return "registry file unreadable before signal"
-            if got != sid:
-                return "registry names another session before signal"
+        d = read_registry(self.cfg.path("claude_sessions"), row["pid"])
+        if d is REGISTRY_UNREADABLE:
+            return "registry file unreadable before signal"
+        if d is not None and d.get("sessionId") != sid:
+            return "registry names another session before signal"
+        why = status_reason(d)
+        if why:
+            return why + " before signal"
         return None
 
     async def kill_children(self, sid, kids):
@@ -555,20 +644,50 @@ async def _run_hook(exe, env):
 
 # ------------------------------------------------------------------ pressure loop (pure-ish)
 
+async def _maybe_await(v):
+    if asyncio.iscoroutine(v):
+        return await v
+    return v
+
+
 class Pressure(object):
     """Hysteresis + global backoff. evict_fn(free) -> outcome or None (no candidate).
-    free_fn may be sync or async."""
+    free_fn and swap_fn may be sync or async. Two triggers: free < low_free_pct ("free"),
+    else swap used >= swap_high_pct ("swap"). Every pass stops at high_free_pct; a
+    swap-triggered pass also stops once swap is below swap_high_pct - 10."""
 
-    def __init__(self, cfg, free_fn, clock=time.time, sleep=asyncio.sleep):
+    SWAP_HYSTERESIS = 10
+
+    def __init__(self, cfg, free_fn, clock=time.time, sleep=asyncio.sleep, swap_fn=None):
         self.cfg, self.free_fn, self.clock, self.sleep = cfg, free_fn, clock, sleep
+        self.swap_fn = swap_fn
         self.backoff_until = 0.0
+        self.trigger = None
 
-    async def relieve(self, free, evict_fn):
-        low, high = float(self.cfg["low_free_pct"]), float(self.cfg["high_free_pct"])
-        if free is None or free >= low:
+    def _trigger(self, free, swap):
+        if free < float(self.cfg["low_free_pct"]):
+            return "free"
+        if free >= float(self.cfg["high_free_pct"]):
+            return None  # every pass stops here: a swap pass must not start above it
+        swap_high = float(self.cfg.get("swap_high_pct") or 0)
+        if swap_high > 0 and swap is not None and swap >= swap_high:
+            return "swap"
+        return None
+
+    async def relieve(self, free, evict_fn, swap=None):
+        high = float(self.cfg["high_free_pct"])
+        trigger = None if free is None else self._trigger(free, swap)
+        if trigger is None:
+            self.trigger = None
             return "comfortable"
         if self.clock() < self.backoff_until:
             return "backoff"
+        if trigger != self.trigger:
+            log.info("memory pressure: trigger=%s (free %s%%, evict below %s%%; swap %s%%, "
+                     "evict at %s%%)", trigger, free, self.cfg["low_free_pct"],
+                     "?" if swap is None else swap, self.cfg.get("swap_high_pct"))
+        self.trigger = trigger
+        swap_stop = float(self.cfg.get("swap_high_pct") or 0) - self.SWAP_HYSTERESIS
         misses = 0
         while True:
             outcome = await evict_fn(free)
@@ -580,19 +699,30 @@ class Pressure(object):
                     return "aborted"
                 continue
             await self.sleep(float(self.cfg["settle_s"]))
-            new = self.free_fn()
-            if asyncio.iscoroutine(new):
-                new = await new
+            new = await _maybe_await(self.free_fn())
             if new is None:
                 return "unreadable"
-            if new - free < 1:
+            new_swap = None
+            if trigger == "swap":
+                new_swap = await _maybe_await(self.swap_fn()) if self.swap_fn is not None else None
+                if new_swap is None:
+                    return "unreadable"
+            gained = new - free >= 1 or (trigger == "swap" and swap - new_swap >= 1)
+            if not gained:
                 self.backoff_until = self.clock() + float(self.cfg["backoff_min"]) * 60
-                log.warning("free memory rose %s -> %s%% after an eviction: the memory is "
-                            "elsewhere; no evictions for %s min", free, new, self.cfg["backoff_min"])
+                if trigger == "swap":
+                    log.warning("free %s -> %s%%, swap %s -> %s%% after an eviction: the memory "
+                                "is elsewhere; no evictions for %s min", free, new, swap, new_swap,
+                                self.cfg["backoff_min"])
+                else:
+                    log.warning("free memory rose %s -> %s%% after an eviction: the memory is "
+                                "elsewhere; no evictions for %s min", free, new, self.cfg["backoff_min"])
                 return "backoff"
             if new >= high:
                 return "relieved"
-            free = new
+            if trigger == "swap" and new_swap < swap_stop:
+                return "relieved"
+            free, swap = new, new_swap
 
 
 def reconcile(conn, probes, now=None, min_age_s=0.0):
@@ -812,8 +942,10 @@ class Daemon(object):
         self.dry_run = dry_run
         self.tabs = ItermTabs(app, connection)
         self.evictor = Evictor(conn, cfg, self.tabs, offload=self.off)
-        self.pressure = Pressure(cfg, lambda: self.off(procs.free_pct))
+        self.pressure = Pressure(cfg, lambda: self.off(procs.free_pct),
+                                 swap_fn=lambda: self.off(procs.swap_pct))
         self.evict_lock = asyncio.Lock()
+        self.pass_lock = asyncio.Lock()  # one pressure or idle pass at a time
         self.last_fire = {}
         self.last_reap = self.last_prune = 0.0
         self.last_said = None
@@ -886,25 +1018,32 @@ class Daemon(object):
         with open(p, "a"):
             os.utime(p, None)
 
-    async def policy(self, focus, rows=None, explicit=False, exclude=()):
+    async def policy(self, focus, rows=None, explicit=False, exclude=(), cfg=None):
         now = time.time()
         rows = live_rows(self.conn) if rows is None else rows
         rows = [r for r in rows if r["session_id"] not in exclude]
         ev = ledger.evictions_today(self.conn, now)
-        return await self.off(compute_policy, self.cfg, focus, rows, ev, explicit, now)
+        before = {r["session_id"]: r.get("transcript") for r in rows}
+        out = await self.off(compute_policy, cfg or self.cfg, focus, rows, ev, explicit, now)
+        heal_transcripts(self.conn, rows, before)
+        return out
 
-    async def pick_and_evict(self, free, rows=None, explicit=False, exclude=()):
+    async def pick_and_evict(self, free, rows=None, explicit=False, exclude=(), policy_cfg=None,
+                             reason=None):
+        """policy_cfg: the config the guards (and the post-CAS re-check) run with; the idle
+        pass swaps idle_min. reason: str, or callable(row) -> str, for the eviction log."""
         async with self.evict_lock:
-            return await self._pick_and_evict(free, rows, explicit, exclude)
+            return await self._pick_and_evict(free, rows, explicit, exclude, policy_cfg, reason)
 
-    async def _pick_and_evict(self, free, rows, explicit, exclude):
+    async def _pick_and_evict(self, free, rows, explicit, exclude, policy_cfg=None, reason=None):
         self.last_pick = None
         focus = await self.snapshot()
         self.stamp_visibility(focus)
-        cands, kept, rss, titles = await self.policy(focus, rows, explicit, exclude)
+        cands, kept, rss, titles = await self.policy(focus, rows, explicit, exclude, cfg=policy_cfg)
         if not cands:
             said = ("none", tuple(sorted((r["session_id"][:8], w) for r, w in kept)))
-            if said != self.last_said:
+            # the idle pass finds nothing on most ticks: only the pressure pass logs keeps
+            if policy_cfg is None and said != self.last_said:
                 log.info("free %s%%: no eviction candidate (%s)", free,
                          "; ".join("%s %s" % (r["session_id"][:8], w) for r, w in kept[:12]))
                 self.last_said = said
@@ -932,22 +1071,24 @@ class Daemon(object):
             if focus2["tty_guid"].get(fresh.get("tty")) != r["iterm_guid_now"]:
                 return "tab changed"
             check = dict(fresh, state=r["state"], state_since=r.get("state_since"))
-            _, k2, _, _ = await self.policy(focus2, rows=[check], explicit=explicit)
+            _, k2, _, _ = await self.policy(focus2, rows=[check], explicit=explicit, cfg=policy_cfg)
             return k2[0][1] if k2 else None
 
         with ledger.tx(self.conn):
             if row["iterm_guid_now"]:
                 self.conn.execute("UPDATE sessions SET iterm_guid=? WHERE session_id=?",
                                   (row["iterm_guid_now"], row["session_id"]))
+        why = reason(row) if callable(reason) else reason
         return await self.evictor.evict(row, free, rss.get(row["session_id"], 0), recheck=recheck,
-                                        title=title)
+                                        title=title, reason=why)
 
-    async def evict_pass(self, free, rows=None, explicit=False, limit=50):
+    async def evict_pass(self, free, rows=None, explicit=False, limit=50, reason=None):
         """Repeated picks that never re-pick a session that aborted in this pass."""
         aborted, outcomes = set(), []
 
         async def one(f):
-            out = await self.pick_and_evict(f, rows=rows, explicit=explicit, exclude=aborted)
+            kw = {"reason": reason} if reason is not None else {}
+            out = await self.pick_and_evict(f, rows=rows, explicit=explicit, exclude=aborted, **kw)
             if out is not None and out not in ("term", "killed") and self.last_pick:
                 aborted.add(self.last_pick)
             if out is not None:
@@ -984,9 +1125,48 @@ class Daemon(object):
         if free is None:
             log.warning("memory_pressure unreadable; not evicting")
         else:
-            one, _ = await self.evict_pass(free)
-            await self.pressure.relieve(free, one)
+            swap = await self.off(procs.swap_pct)
+            async with self.pass_lock:
+                one, _ = await self.evict_pass(free, reason=lambda r: self.pressure.trigger)
+                await self.pressure.relieve(free, one, swap=swap)
+        await self.idle_pass(free)
         self.heartbeat()  # only after a tick that completed
+
+    async def idle_pass(self, free):
+        """Hibernate sessions in state idle for idle_hibernate_min, whatever the memory: the
+        same guards (idle_hibernate_min standing in for idle_min, for idle time, focus and
+        file activity) and the same Evictor as the pressure pass. At most
+        idle_hibernate_per_tick evictions; not subject to the pressure backoff (that is
+        about memory relief); serialized with the pressure pass. -> [outcome]."""
+        mins = float(self.cfg.get("idle_hibernate_min") or 0)
+        if mins <= 0:
+            return []
+        cap = int(self.cfg.get("idle_hibernate_per_tick") or 0)
+        pcfg = config.Config(self.cfg)
+        pcfg["idle_min"] = mins
+        aborted, outcomes, done, misses = set(), [], 0, 0
+
+        def why(r):
+            return "idle %dm" % _mins(time.time() - (r.get("state_since") or time.time()))
+        async with self.pass_lock:
+            while done < cap:
+                if self.connection is not None and not connection_alive(self.connection):
+                    raise ConnectionLost("iTerm2 websocket closed")
+                rows = [r for r in live_rows(self.conn) if r.get("state") == IDLE]
+                out = await self.pick_and_evict(free, rows=rows, exclude=aborted, policy_cfg=pcfg,
+                                                reason=why)
+                if out is None:
+                    break
+                outcomes.append(out)
+                if out in ("term", "killed"):
+                    done += 1
+                    continue
+                if self.last_pick:
+                    aborted.add(self.last_pick)
+                misses += 1
+                if misses >= MAX_ABORTS_PER_PASS:
+                    break
+        return outcomes
 
     async def tick_loop(self):
         failures = 0
