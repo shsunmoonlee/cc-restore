@@ -61,7 +61,8 @@ def hook_main(event, stdin=None, proc_finder=None, now=None):
         proc = (proc_finder or find_proc)()
         conn = ledger.connect(cfg.path("db"))
         try:
-            ledger.apply_event(conn, event, payload, proc, now)
+            ledger.apply_event(conn, event, payload, proc, now,
+                               projects=cfg.path("claude_projects"))
         finally:
             conn.close()
         m = marker_path(cfg, sid)
@@ -136,7 +137,10 @@ def status_data(cfg, conn, now=None):
         "dry_run": bool(cfg.get("dry_run")),
         "config_error": cfg.error,
         "heartbeat_age_s": (now - float(hb)) if hb else None,
+        "idle_hibernate_min": cfg.get("idle_hibernate_min") or 0,
+        "swap_high_pct": cfg.get("swap_high_pct"),
         "memory": {"free_pct": procs.free_pct(), "swap_used_mb": procs.swap_used_mb(),
+                   "swap_pct": procs.swap_pct(),
                    "top": [{"app": k, "rss_mb": round(v)} for k, v in procs.top_apps(table)]},
         "sessions": [{
             "session_id": r["session_id"], "state": r["state"],
@@ -157,13 +161,16 @@ def cmd_status(cfg, a):
         return 0
     now = d["now"]
     hb = d["heartbeat_age_s"]
-    print("daemon heartbeat: %s   dry_run: %s%s" % (
+    ih = d["idle_hibernate_min"]
+    print("daemon heartbeat: %s   dry_run: %s   idle hibernate: %s%s" % (
         "never" if hb is None else _age(now, now - hb) + " ago", "on" if d["dry_run"] else "off",
+        ("after %sm" % ih) if ih else "off",
         ("   CONFIG ERROR: " + d["config_error"]) if d["config_error"] else ""))
     m = d["memory"]
-    print("memory: free %s%%   swap used %s MB   top: %s" % (
+    print("memory: free %s%%   swap used %s MB (%s%%, evict at %s%%)   top: %s" % (
         "?" if m["free_pct"] is None else m["free_pct"],
         "?" if m["swap_used_mb"] is None else int(m["swap_used_mb"]),
+        "?" if m["swap_pct"] is None else m["swap_pct"], d["swap_high_pct"] or "off",
         ", ".join("%s %dMB" % (t["app"], t["rss_mb"]) for t in m["top"])))
     print("%-10s %-6s %-3s %-6s %-2s %-8s %-8s %s" % ("STATE", "FOR", "SUB", "FOCUS", "EV", "TTY", "SID", "CWD  TITLE"))
     for s in d["sessions"]:
@@ -381,6 +388,13 @@ def doctor_checks(cfg):
     fp = procs.free_pct()
     out.append(("PASS" if fp is not None else "FAIL", "memory_pressure",
                 "free %s%%" % fp if fp is not None else "unparseable"))
+    sp = procs.swap_pct()
+    out.append(("PASS" if sp is not None else "WARN", "swap",
+                "used %s%% (pressure at %s%%)" % (sp, cfg.get("swap_high_pct") or "off")
+                if sp is not None else "vm.swapusage unreadable or no swap (swap trigger idle)"))
+    ih = cfg.get("idle_hibernate_min") or 0
+    out.append(("PASS", "idle hibernate", "after %sm idle, %s per tick" % (
+        ih, cfg.get("idle_hibernate_per_tick")) if ih else "off"))
     with tempfile.TemporaryDirectory() as td:
         fails = pending.self_test(td)
     out.append(("FAIL" if fails else "PASS", "transcript shapes", "; ".join(fails) or "self-test ok"))

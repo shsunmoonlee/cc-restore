@@ -38,10 +38,25 @@ A process is identified by (pid, start time), never by pid alone.
 
 ### When does the daemon evict?
 
-Only when free memory (`memory_pressure`) drops below `low_free_pct` (20%); it stops at
+Under memory pressure: when free memory (`memory_pressure`) drops below `low_free_pct` (20%); it stops at
 `high_free_pct` (35%). If free memory does not rise by at least one point after an eviction,
 it stops for `backoff_min` (10 min): the memory is somewhere else, and `cc-sessions status`
 shows where.
+
+Swap counts as pressure too: when swap used/total (`sysctl vm.swapusage`) is at or above
+`swap_high_pct` (75%), the same pass runs even with free memory above `low_free_pct`, and
+stops once swap is below `swap_high_pct` - 10 or free memory reaches `high_free_pct`. With
+mostly swapped-out idle sessions, free memory barely moves on an eviction while swap does.
+The log names the trigger (`trigger=free` or `trigger=swap`). An unreadable swap reading is
+ignored.
+
+Idle hibernation (off by default): with `idle_hibernate_min` above 0, every tick also
+hibernates sessions whose state has been `idle` (not busy, waiting on a prompt or
+resuming) for that many minutes, whatever the memory. Every guard below still applies,
+with `idle_hibernate_min` in place of `idle_min` (idle time, last focus, file activity),
+and the eviction is the same compare-and-set sequence. At most `idle_hibernate_per_tick`
+(3) per tick, least recently focused first. This pass ignores the pressure backoff, never
+overlaps a pressure pass, and logs `reason=idle <N>m`.
 
 A session is a candidate only if every guard passes (each failure is logged as a keep
 reason): written by hooks, interactive, idle for `idle_min` (10 min), no subagents, its
@@ -49,8 +64,9 @@ process identity still matches, its tty is an iTerm2 tab that is not the visible
 window and was not focused in the last `idle_min`, not resumed in the last `cooldown_min`
 (45 min), fewer than `max_evictions_per_day` (3) today, it has a transcript with a user
 message, no transcript/subagent/task file changed in the last `idle_min`, no background
-work in flight (async agents, background shells, monitors, queued input, a scheduled
-wakeup, a usage-limit wait), and no child process other than MCP helpers. Candidates go in
+work in flight (async agents, workflows, background shells, monitors until their
+timeout or a terminal notification, queued input, a scheduled wakeup, a non-durable cron
+job, a usage-limit wait), and no child process other than MCP helpers and hook runners. Candidates go in
 order of least recent focus, then largest memory.
 
 "Visible" deliberately means every pane of the current tab of every iTerm2 window,
@@ -145,14 +161,18 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 |---|---|---|
 | `db` | `~/.claude/state/cc-sessions.db` | the ledger |
 | `low_free_pct` / `high_free_pct` | 20 / 35 | evict below, stop at |
+| `swap_high_pct` | 75 | swap used % that counts as memory pressure (0 = off) |
 | `idle_min` | 10 | minutes idle, unfocused and without file activity |
+| `idle_hibernate_min` | 0 (off) | hibernate any session idle this many minutes, regardless of memory |
+| `idle_hibernate_per_tick` | 3 | most idle-pass evictions per tick |
 | `cooldown_min` | 45 | no eviction this soon after a resume |
 | `max_evictions_per_day` | 3 | per session |
 | `term_grace_s` | 15 | SIGTERM to SIGKILL |
 | `tick_s` | 30 | pressure check interval |
 | `settle_s` / `backoff_min` | 10 / 10 | global backoff when an eviction frees nothing |
 | `stale_busy_min` | 30 | busy this long + Esc-interrupted transcript = idle |
-| `helper_patterns` | `["mcp", "npm exec ", "/.bin/", "-mcp"]` | child processes that are not work |
+| `helper_patterns` | `["mcp", "npm exec ", "/.bin/", "-mcp"]` | child processes that are not work (hook runners always are not; a shell-snapshot shell always is) |
+| `cron_recurring_block_h` | 24 | hours a non-durable recurring cron job keeps its session |
 | `on_evict` | null | executable run after an eviction with `CC_SESSION_ID`, `CC_SESSION_CWD`, `CC_SESSION_TITLE`, `CC_EVICT_OUTCOME` |
 | `daemon_python` | `~/.claude/venvs/iterm2/bin/python` | python with `iterm2` |
 | `resume_command` | installed `cc-resume` | what gets typed into tabs |

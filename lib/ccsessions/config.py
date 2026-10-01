@@ -15,6 +15,11 @@ DEFAULTS = {
     "db": "~/.claude/state/cc-sessions.db",
     "low_free_pct": 20,
     "high_free_pct": 35,
+    # swap used/total at or above this counts as memory pressure (0 = off)
+    "swap_high_pct": 75,
+    # hibernate any session idle this many minutes, regardless of memory (0 = off)
+    "idle_hibernate_min": 0,
+    "idle_hibernate_per_tick": 3,
     "idle_min": 10,
     "cooldown_min": 45,
     "max_evictions_per_day": 3,
@@ -22,7 +27,11 @@ DEFAULTS = {
     "tick_s": 30,
     # Child processes that do not count as work (MCP servers and their launchers).
     # `caffeinate` is deliberately NOT here: Claude Code runs it while a turn is busy.
+    # Hook runners (bash ~/.claude/hooks/*.sh, plugin `/bin/sh -c export PATH=` launchers)
+    # are always helpers; a Bash-tool/Monitor shell (shell-snapshots) is always work.
     "helper_patterns": ["mcp", "npm exec ", "/.bin/", "-mcp"],
+    # a non-durable recurring CronCreate job keeps the session this many hours after creation
+    "cron_recurring_block_h": 24,
     "on_evict": None,
     "daemon_python": "~/.claude/venvs/iterm2/bin/python",
     "claude_projects": "~/.claude/projects",

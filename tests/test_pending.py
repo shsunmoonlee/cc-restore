@@ -21,8 +21,10 @@ class Pending(TempEnv):
         launch = {"type": "user", "timestamp": iso(time.time() - 60),
                   "toolUseResult": {"isAsync": True, "agentId": "ag1"}}
         self.assertEqual(self.an([user("go"), launch])["pending"], ["1 agent running"])
-        note = user("<task-notification><task-id>ag1</task-id>done</task-notification>")
+        note = user("<task-notification><task-id>ag1</task-id><status>completed</status>done</task-notification>")
         self.assertEqual(self.an([user("go"), launch, note])["pending"], [])
+        bare = user("<task-notification><task-id>ag1</task-id>done</task-notification>")
+        self.assertEqual(self.an([user("go"), launch, bare])["pending"], ["1 agent running"])
 
     def test_background_bash_and_monitor_and_taskstop(self):
         bg = {"type": "user", "timestamp": iso(time.time() - 60), "toolUseResult": {"backgroundTaskId": "b1"}}

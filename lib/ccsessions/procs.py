@@ -244,10 +244,25 @@ def ps_commands():
     return table
 
 
+SHELL_SNAPSHOT = "/.claude/shell-snapshots/snapshot-"
+HOOKS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks") + os.sep
+
+
+def is_hook_runner(cmd):
+    """A Claude Code hook runner: `bash|sh|zsh ~/.claude/hooks/<script>`, or a plugin hook
+    launched as `/bin/sh -c export PATH=... ${CLAUDE_PLUGIN_ROOT}...`."""
+    toks = (cmd or "").split()
+    if len(toks) >= 2 and os.path.basename(toks[0]) in ("bash", "sh", "zsh") \
+            and toks[1].startswith(HOOKS_DIR):
+        return True
+    return cmd.startswith("/bin/sh -c export PATH=") and "CLAUDE_PLUGIN_ROOT" in cmd
+
+
 def working_children(pid, table, helper_patterns):
-    """Descendants of pid that count as work. A helper (MCP server, launcher) and its
-    whole subtree are ignored; anything else (a Bash tool shell, caffeinate, a dev
-    server) is work."""
+    """Descendants of pid that count as work. A Bash-tool/Monitor shell (its command
+    sources a shell snapshot) is always work, whatever helper_patterns say. A helper (MCP
+    server, launcher, hook runner) and its whole subtree are ignored; anything else
+    (caffeinate, a dev server) is work."""
     kids = {}
     for cpid, ent in table.items():
         kids.setdefault(ent[0], []).append(cpid)
@@ -258,7 +273,11 @@ def working_children(pid, table, helper_patterns):
             continue
         seen.add(c)
         cmd = table[c][-1]
-        if any(h in cmd for h in helper_patterns):
+        if SHELL_SNAPSHOT in cmd:
+            out.append("shell task")
+            stack.extend(kids.get(c, []))
+            continue
+        if is_hook_runner(cmd) or any(h in cmd for h in helper_patterns):
             continue
         first = (cmd.split() or ["?"])[0]
         if "shell-snapshots" in cmd or os.path.basename(first).lstrip("-") in ("zsh", "bash", "sh", "fish"):
@@ -315,6 +334,28 @@ def swap_used_mb():
     out = _run(["sysctl", "-n", "vm.swapusage"])
     m = re.search(r"used\s*=\s*([\d.]+)M", out or "")
     return float(m.group(1)) if m else None
+
+
+def parse_swapusage(out):
+    """(total_mb, used_mb) from `sysctl vm.swapusage`, or None when it does not parse or
+    there is no swap."""
+    t = re.search(r"total\s*=\s*([\d.]+)M", out or "")
+    u = re.search(r"used\s*=\s*([\d.]+)M", out or "")
+    if not t or not u:
+        return None
+    try:
+        total, used = float(t.group(1)), float(u.group(1))
+    except ValueError:
+        return None
+    if total <= 0:
+        return None
+    return total, used
+
+
+def swap_pct():
+    """Swap used as a percentage of swap total, or None when it cannot be read."""
+    tu = parse_swapusage(_run(["sysctl", "-n", "vm.swapusage"]))
+    return None if tu is None else round(tu[1] * 100.0 / tu[0], 1)
 
 
 def parse_boottime(out):
