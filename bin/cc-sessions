@@ -1,0 +1,29 @@
+#!/usr/bin/python3
+"""cc-sessions: Claude Code session ledger, restore, holds and memory daemon control.
+Run `cc-sessions -h`. Runs on the system python3 (3.9+), stdlib only."""
+import os
+import sys
+
+
+def _libdir():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in (os.path.join(here, "..", "lib", "cc-sessions"), os.path.join(here, "..", "lib")):
+        if os.path.isdir(os.path.join(c, "ccsessions")):
+            return os.path.normpath(c)
+    return None
+
+
+if __name__ == "__main__":
+    hook = len(sys.argv) > 1 and sys.argv[1] == "hook"
+    try:
+        lib = _libdir()
+        if lib is None:
+            raise ImportError("ccsessions package not found next to %s" % __file__)
+        sys.path.insert(0, lib)
+        from ccsessions.cli import main
+        rc = main(sys.argv[1:])
+    except BaseException:
+        if not hook:
+            raise
+        rc = 0  # a hook must never fail Claude Code
+    sys.exit(0 if hook else (rc or 0))

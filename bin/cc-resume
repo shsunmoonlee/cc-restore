@@ -1,0 +1,243 @@
+#!/usr/bin/python3
+"""cc-resume: resume a Claude Code session by id, even after its worktree was parked.
+
+    cc-resume <session-id> [--cwd <dir>] [--dry-run]
+
+The one resume command every tool types into a tab (the daemon, `cc-sessions restore`).
+`cd <cwd> && claude --resume <id>` breaks when a worktree sweeper has parked the worktree
+(WIP commit on its branch, files archived, folder removed). This resolves the session's cwd
+(ledger, then transcript), and when a `<repo><worktree_marker><name>` folder is gone and a
+parked branch exists, undoes the park first:
+
+  1. git worktree add <cwd> <branch>   (branch from the archive MANIFEST.md, else
+                                        <park_branch_prefix><name>)
+  2. git reset HEAD~1 when the tip is the park commit (mixed: the changes stay)
+  3. copy <archive>/<name>/files/ back without overwriting
+When no branch survives (the sweeper removed the worktree and deleted its branch), step 1
+is `git worktree add -b <park_branch_prefix><name> <cwd> <base>` instead, with <base> the
+MANIFEST.md HEAD when that commit exists, else origin's default branch.
+Then execs `claude --resume <id>` there. Nothing here deletes.
+
+Refuses (exit 1) when the ledger shows the session's process still running. Before exec
+it writes its own identity (pid + start) and state `resuming` into the row (tolerating a
+missing ledger), so a resume that comes up under a new id supersedes the row.
+Config keys (see cc-sessions): worktree_marker, park_archive_dir ({repo_key}),
+park_branch_prefix, park_commit_subject, claude_projects.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+
+def _libdir():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in (os.path.join(here, "..", "lib", "cc-sessions"), os.path.join(here, "..", "lib")):
+        if os.path.isdir(os.path.join(c, "ccsessions")):
+            return os.path.normpath(c)
+    return None
+
+
+_LIB = _libdir()
+if _LIB:
+    sys.path.insert(0, _LIB)
+from ccsessions import config, ledger, procs  # noqa: E402
+
+
+def say(msg):
+    print("\x1b[2m[cc-resume] %s\x1b[0m" % msg, file=sys.stderr)
+
+
+def cwd_from_transcript(projects, sid):
+    ts = sorted(glob.glob(os.path.join(projects, "*", "%s.jsonl" % sid)),
+                key=os.path.getmtime, reverse=True)
+    for t in ts:
+        try:
+            with open(t, errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i > 400:
+                        break
+                    try:
+                        c = json.loads(line).get("cwd")
+                    except (ValueError, AttributeError):
+                        continue
+                    if c:
+                        return c
+        except OSError:
+            continue
+    return None
+
+
+def git(*args, **kw):
+    return subprocess.run(["git"] + list(args), cwd=kw.get("cwd"), capture_output=True, text=True)
+
+
+def repo_key(repo):
+    return repo.lstrip("/").replace("/", "-")
+
+
+def parked_branch(cfg, repo, name):
+    arch = os.path.join(os.path.expanduser(cfg["park_archive_dir"].replace("{repo_key}", repo_key(repo))), name)
+    manifest = os.path.join(arch, "MANIFEST.md")
+    cands = []
+    try:
+        with open(manifest, errors="replace") as fh:
+            m = re.search(r"^- branch:\s+(\S+)", fh.read(), re.M)
+        if m:
+            cands.append(m.group(1))
+    except OSError:
+        pass
+    cands.append(cfg["park_branch_prefix"] + name)
+    for b in cands:
+        if git("rev-parse", "--verify", "--quiet", "refs/heads/%s" % b, cwd=repo).returncode == 0:
+            return b, arch
+    return None, arch
+
+
+def removed_base(arch, repo):
+    """Commit to recreate a removed worktree at: the archived HEAD, else origin's default."""
+    try:
+        with open(os.path.join(arch, "MANIFEST.md"), errors="replace") as fh:
+            m = re.search(r"^- HEAD:\s+([0-9a-f]{7,40})\b", fh.read(), re.M)
+        if m and git("cat-file", "-e", m.group(1) + "^{commit}", cwd=repo).returncode == 0:
+            return m.group(1)
+    except OSError:
+        pass
+    r = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", cwd=repo)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    for b in ("origin/main", "origin/master"):
+        if git("rev-parse", "--verify", "--quiet", b, cwd=repo).returncode == 0:
+            return b
+    return None
+
+
+def unpark(cfg, cwd, dry):
+    marker = cfg["worktree_marker"]
+    repo, name = cwd.split(marker, 1)
+    name = name.split("/")[0]
+    wt = repo + marker + name
+    if not os.path.isdir(repo):
+        return False, "repo %s is gone" % repo
+    branch, arch = parked_branch(cfg, repo, name)
+    if branch:
+        say("worktree %s was parked; restoring it from branch %s" % (name, branch))
+        add = ["worktree", "add", wt, branch]
+    else:
+        # Removed, not parked: the sweep only does that when every commit is safe on the
+        # default branch or origin, so a fresh branch at the archived HEAD (else the
+        # default branch) gives the session a working cwd again.
+        base = removed_base(arch, repo)
+        if not base:
+            return False, "no parked branch or base commit for %s; see %s" % (
+                name, os.path.join(arch, "MANIFEST.md"))
+        branch = cfg["park_branch_prefix"] + name
+        say("worktree %s was removed; recreating it on new branch %s at %s" % (name, branch, base))
+        add = ["worktree", "add", "-b", branch, wt, base]
+    if dry:
+        return True, "dry-run"
+    r = git(*add, cwd=repo)
+    if r.returncode != 0 and "missing but already registered" in r.stderr:
+        r = git(*(add[:2] + ["-f"] + add[2:]), cwd=repo)
+    if r.returncode != 0:
+        return False, ("git worktree add failed: %s\n  recover by hand: git -C %s worktree add %s %s"
+                       % (r.stderr.strip(), shlex.quote(repo), shlex.quote(wt), shlex.quote(branch)))
+    if git("log", "-1", "--format=%s", cwd=wt).stdout.startswith(cfg["park_commit_subject"]):
+        if git("reset", "--quiet", "HEAD~1", cwd=wt).returncode == 0:
+            say("undid the park commit (changes are back as uncommitted)")
+        else:
+            say("could not undo the park commit; run `git reset HEAD~1` in %s" % wt)
+    files = os.path.join(arch, "files")
+    if os.path.isdir(files):
+        subprocess.run(["cp", "-Rn", files + "/.", wt + "/"], capture_output=True)
+        say("restored archived files from %s" % files)
+    say("untracked files (env files, dependencies) are not part of the branch; recreate them if needed")
+    return True, "restored"
+
+
+def fallback_dir(cfg, cwd):
+    marker = cfg["worktree_marker"]
+    if marker in cwd:
+        repo = cwd.split(marker, 1)[0]
+        if os.path.isdir(repo):
+            return repo
+    p = cwd
+    while p and not os.path.isdir(p) and os.path.dirname(p) != p:
+        p = os.path.dirname(p)
+    return p or os.path.expanduser("~")
+
+
+def ledger_row(cfg, sid):
+    try:
+        conn = ledger.connect(cfg.path("db"), readonly=True)
+        try:
+            return ledger.get(conn, sid)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def mark_resuming(cfg, sid, pid=None, pid_start=None):
+    """Write this process's identity + state resuming into the row before exec (exec keeps
+    pid and start time, so the claude that follows IS this identity)."""
+    try:
+        if not os.path.exists(cfg.path("db")):
+            return
+        if pid is None:
+            pid = os.getpid()
+            info = procs.proc_info(pid)
+            pid_start = info["pid_start"] if info else None
+        conn = ledger.connect(cfg.path("db"))
+        try:
+            ledger.claim_resume(conn, sid, pid, pid_start)
+        finally:
+            conn.close()
+    except Exception:
+        pass  # the ledger is advisory here; never block a resume on it
+
+
+def main(argv=None, identity=None):
+    ap = argparse.ArgumentParser(prog="cc-resume")
+    ap.add_argument("sid")
+    ap.add_argument("--cwd", help="session cwd, when the caller already knows it")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args(argv)
+    cfg = config.load()
+    identity = identity or (lambda r: procs.identity_alive(r.get("pid"), r.get("pid_start")))
+
+    row = ledger_row(cfg, a.sid)
+    if row and row.get("pid") and identity(row):
+        say("session %s is already running (pid %s, tty %s); not starting a second copy"
+            % (a.sid[:8], row["pid"], row.get("tty") or "?"))
+        return 1
+    cwd = a.cwd or (row or {}).get("cwd") or cwd_from_transcript(cfg.path("claude_projects"), a.sid)
+    if not cwd:
+        say("no transcript for %s; trying a plain resume here" % a.sid)
+        try:
+            cwd = os.getcwd()
+        except FileNotFoundError:  # tabs of hibernated sessions often sit in a deleted dir
+            cwd = os.path.expanduser("~")
+    if not os.path.isdir(cwd) and cfg["worktree_marker"] in cwd:
+        ok, why = unpark(cfg, cwd, a.dry_run)
+        if not ok:
+            say(why)
+    if not os.path.isdir(cwd) and not a.dry_run:
+        alt = fallback_dir(cfg, cwd)
+        say("%s is gone; resuming in %s" % (cwd, alt))
+        cwd = alt
+    cmd = ["claude", "--resume", a.sid]
+    if a.dry_run:
+        print("cd %s && %s" % (shlex.quote(cwd), " ".join(shlex.quote(c) for c in cmd)))
+        return 0
+    mark_resuming(cfg, a.sid)
+    os.chdir(cwd)
+    os.execvp(cmd[0], cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

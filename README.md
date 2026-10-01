@@ -1,120 +1,191 @@
-# cc-restore
+# cc-sessions
 
-Reopen all your Claude Code CLI sessions after a MacBook restart. One iTerm2 window, one tab per session, each resuming with its full transcript.
+Session bookkeeping for [Claude Code](https://code.claude.com) on macOS + iTerm2:
 
-You had 20 terminal tabs, each running a long-lived `claude` conversation. The machine rebooted (or you closed the window). The processes are gone, but every conversation still exists on disk. `cc-restore` figures out exactly which sessions were alive when the machine went down and brings them all back:
+- a **ledger** of every session's state, written by Claude Code's own hooks (no scraping);
+- a **daemon** that frees memory under pressure by hibernating the least recently used idle
+  sessions (graceful SIGTERM, recorded first) and resumes one when you click its tab;
+- **restore** after a crash, power loss or shutdown;
+- **holds**, so a worktree cleaner can ask "does any session still need this directory?".
 
-```
-$ cc-restore
-source: ~/.claude/sessions state files (0 live, 23 stale)
-  open 9aa2bb4f  ~/Code/myapp/.claude/worktrees/proud-sprouting-cocoa
-       "after our recent upgrade, google login stopped working"
-  open 267a938f  ~/Code/myapp
-       "users gave feedback that the progress bar feels slow"
-  ...
-opened 23 tabs.
-```
+Formerly `cc-restore`. See [Migrating from v1](#migrating-from-v1).
 
 ## How it works
 
-Claude Code (2.1.x) writes one state file per live process to `~/.claude/sessions/<PID>.json` containing the session id and working directory, and removes it on clean exit. After a reboot or crash, the files whose PID is dead are exactly the sessions that were alive at shutdown. `cc-restore` reads them, skips anything already running, and drives iTerm2 via AppleScript to open a tab per session running `cd <cwd> && claude --resume <session-id>`.
+```
+Claude Code hooks (8 events) --> cc-sessions hook <Event> --> ~/.claude/state/cc-sessions.db
+                                                                  ^        |
+launchd (KeepAlive) --> cc_sessions_daemon.py -------------------+        +--> restore, holds,
+   iTerm2 API: focus events, tab control; memory_pressure; evict; resume      status, doctor
+```
 
-If no state files exist (older Claude Code), it falls back to a heuristic: live sessions touch their transcript file at least hourly, so the newest cluster of transcript mtimes before boot time identifies the shutdown set.
+One writer per fact: hooks write session state (busy, idle, waiting, ended); the daemon
+writes focus, evictions, requests and its heartbeat. Everything else only reads.
 
-Extras:
+### Session states
 
-- Sessions that lived in a Claude Code worktree (`<repo>/.claude/worktrees/<name>`) that has since been swept are restored anyway: the tab re-adds the worktree from its `worktree/<name>` branch before resuming.
-- Dedup is process-aware. A session already open anywhere (even one started as bare `claude`, with no id in its argv) is never resumed a second time, which would interleave two writers into one transcript.
+| state | set by |
+|---|---|
+| `idle` | SessionStart, Stop, StopFailure, Notification `idle_prompt` (when no subagents run) |
+| `busy` | UserPromptSubmit |
+| `waiting` | Notification `permission_prompt` / `elicitation_dialog` |
+| `ended` | SessionEnd |
+| `evicting` -> `hibernated` | the daemon, then SessionEnd (or the daemon after the grace period) |
+| `resuming` | cc-resume / the daemon, until SessionStart(resume) turns it `idle` |
+| `superseded` | SessionStart in the same process under a new id (`/clear`, in-app `/resume`) |
+
+A process is identified by (pid, start time), never by pid alone.
+
+### When does the daemon evict?
+
+Only when free memory (`memory_pressure`) drops below `low_free_pct` (20%); it stops at
+`high_free_pct` (35%). If free memory does not rise by at least one point after an eviction,
+it stops for `backoff_min` (10 min): the memory is somewhere else, and `cc-sessions status`
+shows where.
+
+A session is a candidate only if every guard passes (each failure is logged as a keep
+reason): written by hooks, interactive, idle for `idle_min` (10 min), no subagents, its
+process identity still matches, its tty is an iTerm2 tab that is not the visible tab of any
+window and was not focused in the last `idle_min`, not resumed in the last `cooldown_min`
+(45 min), fewer than `max_evictions_per_day` (3) today, it has a transcript with a user
+message, no transcript/subagent/task file changed in the last `idle_min`, no background
+work in flight (async agents, background shells, monitors, queued input, a scheduled
+wakeup, a usage-limit wait), and no child process other than MCP helpers. Candidates go in
+order of least recent focus, then largest memory.
+
+"Visible" deliberately means every pane of the current tab of every iTerm2 window,
+including minimized windows and windows on other Spaces: the daemon cannot tell whether
+you are looking at a window, so it treats every window's front tab as seen. This is
+conservative (such a tab is never evicted, and counts as seen on every tick).
+
+Eviction: compare-and-set the row to `evicting`, re-check the guards, SIGTERM, SIGKILL only
+after `term_grace_s` (15 s, logged as an INCIDENT). The tab gets a banner, the title
+`[zz] <title>`, and the resume command typed but not run. Focusing that tab later runs it.
 
 ## Install
 
-```bash
-git clone https://github.com/shsunmoonlee/cc-restore
-cp cc-restore/cc-restore ~/.local/bin/   # or anywhere on PATH
-chmod +x ~/.local/bin/cc-restore
+Requirements: macOS, iTerm2 with the Python API enabled (Settings > General > Magic), the
+system `/usr/bin/python3` (3.9+) for the CLI and hooks, and a python with the `iterm2`
+package for the daemon:
+
+```sh
+python3 -m venv ~/.claude/venvs/iterm2 && ~/.claude/venvs/iterm2/bin/pip install iterm2
+make install                       # PREFIX=~/.claude by default; nothing is started
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-sessions.daemon.plist
 ```
 
-Requirements: macOS, iTerm2, Claude Code 2.1+ (older versions work via the fallback), Python 3.9+ (system python3 is fine). No dependencies, no daemon, nothing to run before the crash.
+`make install` copies `bin/*` to `$PREFIX/bin`, the library to `$PREFIX/lib/cc-sessions/`,
+and renders the launchd agent. `make check` exits 1 when an installed file differs from the
+repo. `make uninstall` removes them.
 
-## Usage
-
-```bash
-cc-restore                # restore everything that died recently (default max age 7 days)
-cc-restore --dry-run      # print the plan, open nothing
-cc-restore --hours 12     # only sessions active in the last 12 hours
-cc-restore --max-age-days 3
-cc-restore --legacy       # force the transcript-mtime heuristic
-cc-restore --auto         # boot-gated mode for launchd, see below
-cc-restore --limit 40     # safety cap on tabs (default 40)
-```
-
-Run it soon after boot, ideally before starting new Claude work. Or make it automatic:
-
-## Automatic restore at login (Chrome-style)
-
-iTerm2's own restoration brings back windows and scrollback after a reboot but can never revive processes, so the Chrome-like experience is a login agent that runs `cc-restore --auto`:
-
-```xml
-<!-- ~/Library/LaunchAgents/com.yourname.cc-restore.plist -->
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>com.yourname.cc-restore</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/bin/sh</string>
-		<string>-c</string>
-		<string>sleep 10; exec /Users/YOU/.local/bin/cc-restore --auto</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>StandardOutPath</key>
-	<string>/Users/YOU/Library/Logs/cc-restore.log</string>
-	<key>StandardErrorPath</key>
-	<string>/Users/YOU/Library/Logs/cc-restore.log</string>
-</dict>
-</plist>
-```
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yourname.cc-restore.plist
-```
-
-`--auto` is designed for exactly this: it only restores sessions that were killed by the shutdown or a crash (state files predating the current boot), never tabs you closed on purpose (clean exits delete their state file, and anything that died after boot is skipped), it runs at most once per boot (marker in `~/.cache/cc-restore.bootmark`), and it exits quietly when there is nothing to do. The first restore after a reboot may show one macOS dialog asking to allow control of iTerm2; approve it once.
-
-## Bonus: always resume with the full transcript
-
-Claude Code interrupts `--resume` on large or old sessions with a picker ("We recommend resuming from a summary"). If you always want the full conversation back with no prompt, either pick the hidden third option "Don't ask me again" once, or set it directly:
-
-```bash
-# writes the same flag the menu option writes
-python3 -c "import json,pathlib; p=pathlib.Path.home()/'.claude.json'; d=json.loads(p.read_text()); d['resumeReturnDismissed']=True; p.write_text(json.dumps(d,indent=2))"
-```
-
-Belt and braces, since running claude processes can rewrite `~/.claude.json`: raise the trigger thresholds in `~/.claude/settings.json` so the prompt can never fire:
+Wire the hooks in `~/.claude/settings.json` (one entry per event):
 
 ```json
-{
-  "env": {
-    "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES": "525600",
-    "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD": "999999999"
-  }
-}
+{ "hooks": {
+  "SessionStart":     [{"hooks": [{"type": "command", "command": "cc-sessions hook SessionStart", "timeout": 5}]}],
+  "SessionEnd":       [{"hooks": [{"type": "command", "command": "cc-sessions hook SessionEnd", "timeout": 5}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "cc-sessions hook UserPromptSubmit", "timeout": 5}]}],
+  "Stop":             [{"hooks": [{"type": "command", "command": "cc-sessions hook Stop", "timeout": 5}]}],
+  "StopFailure":      [{"hooks": [{"type": "command", "command": "cc-sessions hook StopFailure", "timeout": 5}]}],
+  "SubagentStart":    [{"hooks": [{"type": "command", "command": "cc-sessions hook SubagentStart", "timeout": 5}]}],
+  "SubagentStop":     [{"hooks": [{"type": "command", "command": "cc-sessions hook SubagentStop", "timeout": 5}]}],
+  "Notification":     [{"hooks": [{"type": "command", "command": "cc-sessions hook Notification", "timeout": 5}]}]
+} }
 ```
 
-## Caveats
+The hook always exits 0 and prints nothing; a failure is logged and leaves a marker that
+blocks eviction of that session until its next successful hook.
 
-- The state files, the transcript heartbeat, and the resume-prompt flag are internal Claude Code behavior, not documented API. Tested against Claude Code 2.1.251; a future release could change any of them. The fallback heuristic and the explicit `--resume <id>` contract are the stable core.
-- Tab order and window layout are not preserved, only the set of sessions.
-- iTerm2 only. Terminal.app and other emulators are not supported (PRs welcome).
+Start with `"dry_run": true` in the config, watch `~/Library/Logs/cc-sessions.log`, then
+turn it off. `cc-sessions doctor` checks the whole setup.
 
-## Alternatives
+## Commands
 
-- [asadtariq96/cc-session-restore](https://github.com/asadtariq96/cc-session-restore): same idea, but requires a launchd agent snapshotting state before the crash. cc-restore reconstructs after the fact and needs nothing pre-installed.
-- [timvw/tmux-assistant-resurrect](https://github.com/timvw/tmux-assistant-resurrect): the mature option if you live in tmux instead of iTerm2 tabs (pair with tmux-resurrect and tmux-continuum).
-- iTerm2's native session restoration brings back window layout and scrollback after a reboot, but never the running processes. It composes well with cc-restore.
+```
+cc-sessions status [--json]          sessions, idle ages, memory, top apps by RSS, heartbeat
+cc-sessions state <sid>              the state word (exit 1 + "unknown" if not in the ledger)
+cc-sessions hibernate <sid>|--all-idle   ask the daemon (explicit: skips pressure + idle time only)
+cc-sessions wake <sid>|--all         resume in the original tab, or a new tab if it is gone
+cc-sessions pending <transcript>     {"pending": [...], "last_text": "..."}; unreadable = pending
+cc-sessions holds <path> [-v]        exit 0 held, 1 free, 2 ledger unreadable (treat != 1 as held)
+cc-sessions restore [--auto] [--dry-run] [--limit N] [--include-hibernated] [--max-age-days N]
+cc-sessions import-legacy [--manifests DIR] [--registry DIR]
+cc-sessions doctor                   PASS/FAIL checks, exit 1 on any FAIL
+cc-sessions reap [--dry-run]         delete dead-pid sockets; list (never kill) orphans
+cc-sessions daemon [--once] [--dry-run]   run the daemon in the foreground; --once prints
+                                          the candidate table with keep reasons and exits
+cc-resume <sid> [--cwd DIR] [--dry-run]   resume a session, unparking its worktree if needed
+```
+
+### restore
+
+Restores sessions whose process is gone but whose SessionEnd never arrived (crash, power
+loss), plus the shutdown cluster: sessions that ended with reason `other` together, right
+before boot. A deliberate exit is never restored. `--auto` (for a login launchd job) runs at
+most once per boot, only for sessions last active before boot, and also retypes (without
+running) the resume command for hibernated sessions whose tab no longer exists.
+`--max-age-days N` overrides `restore_max_age_days` (7; 0 = no limit). `--auto` never looks
+back less than 30 days, and only an explicit `--max-age-days 0` lifts that floor. With
+`--include-hibernated` (not `--auto`), a hibernated session whose worktree is gone but whose
+git repo remains is still typed: cc-resume rebuilds the worktree.
+
+### holds
+
+For a worktree sweeper: a session holds `W` when its cwd (or launch cwd) is `W` or under
+`W/` (a session in a parent directory does not), and it is alive, or hibernated within
+`hibernate_keep_days` (60), or active within `session_age_days` (30), or a transcript for
+`W` changed within `session_age_days`.
+
+## Configuration
+
+`~/.config/cc-sessions/config.json`, every key optional (`CC_SESSIONS_CONFIG` overrides the
+path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file that does not parse forces `dry_run` on.
+
+| key | default | |
+|---|---|---|
+| `db` | `~/.claude/state/cc-sessions.db` | the ledger |
+| `low_free_pct` / `high_free_pct` | 20 / 35 | evict below, stop at |
+| `idle_min` | 10 | minutes idle, unfocused and without file activity |
+| `cooldown_min` | 45 | no eviction this soon after a resume |
+| `max_evictions_per_day` | 3 | per session |
+| `term_grace_s` | 15 | SIGTERM to SIGKILL |
+| `tick_s` | 30 | pressure check interval |
+| `settle_s` / `backoff_min` | 10 / 10 | global backoff when an eviction frees nothing |
+| `stale_busy_min` | 30 | busy this long + Esc-interrupted transcript = idle |
+| `helper_patterns` | `["mcp", "npm exec ", "/.bin/", "-mcp"]` | child processes that are not work |
+| `on_evict` | null | executable run after an eviction with `CC_SESSION_ID`, `CC_SESSION_CWD`, `CC_SESSION_TITLE`, `CC_EVICT_OUTCOME` |
+| `daemon_python` | `~/.claude/venvs/iterm2/bin/python` | python with `iterm2` |
+| `resume_command` | installed `cc-resume` | what gets typed into tabs |
+| `worktree_marker` | `/.claude/worktrees/` | worktree folder marker (cc-resume) |
+| `park_archive_dir` | `~/.claude/repos/{repo_key}/archive` | where a sweeper archived a parked worktree |
+| `park_branch_prefix` / `park_commit_subject` | `worktree/` / `wip(auto-park)` | how a parked worktree is recognized |
+| `hibernate_keep_days` / `session_age_days` | 60 / 30 | holds windows |
+| `log` | `~/Library/Logs/cc-sessions.log` | rotated 1 MB x 3 |
+| `dry_run` | false | log "would evict" and never act |
+
+## Development
+
+```sh
+make test            # /usr/bin/python3 -m unittest discover -s tests
+make release-check   # CC_SESSIONS_PRIVATE_STRINGS=<file with one string per line>
+```
+
+Tests use temp ledgers and never signal processes or talk to iTerm2.
+
+## Migrating from v1
+
+v1 was five scripts (`cc-restore`, `cc-hibernate`, `cc-wake`, `cc-tabwatch`, `cc-daemon`)
+that inferred session state from Claude Code's internal registry and transcripts, killed
+idle sessions with SIGKILL on a timer, and kept hibernation manifests as JSON files.
+
+1. `make install`, wire the hooks, `cc-sessions import-legacy` (imports un-woken
+   hibernation manifests and live registry entries; idempotent).
+2. Replace a `cc-restore --auto` launchd job with `cc-sessions restore --auto`.
+3. Load the daemon agent in dry-run, then live.
+4. Stop and remove `cc-daemon`, `cc-hibernate`, `cc-tabwatch`, `cc-wake`, `cc-restore` and
+   any shell-profile line that started them.
+
+Dropped: the transcript-mtime `--legacy` restore heuristic, and timer-based eviction.
 
 ## License
 
