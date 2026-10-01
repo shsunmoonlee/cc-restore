@@ -209,3 +209,36 @@ class CcResume(TempEnv):
         wt = repo + cfg["worktree_marker"] + "gone"
         self.assertEqual(self.mod.fallback_dir(cfg, wt + "/sub"), repo)
         self.assertEqual(self.mod.fallback_dir(cfg, os.path.join(self.tmp, "x", "y")), self.tmp)
+
+    def test_removed_worktree_recreated_at_manifest_head(self):
+        cfg = dict(self.cfg)
+        cfg["park_archive_dir"] = os.path.join(self.tmp, "arch", "{repo_key}")
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        g = lambda *a: self.mod.git(*a, cwd=repo)
+        g("init", "-q", "-b", "main")
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c1")
+        head = g("rev-parse", "HEAD").stdout.strip()
+        arch = os.path.join(self.tmp, "arch", self.mod.repo_key(repo), "wt1")
+        os.makedirs(os.path.join(arch, "files"))
+        with open(os.path.join(arch, "MANIFEST.md"), "w") as fh:
+            fh.write("- branch:    worktree/gone-branch\n- HEAD:      %s  c1\n" % head)
+        with open(os.path.join(arch, "files", "plan.md"), "w") as fh:
+            fh.write("plan")
+        wt = repo + cfg["worktree_marker"] + "wt1"
+        with redirect_stderr(io.StringIO()):
+            ok, why = self.mod.unpark(cfg, wt + "/sub", False)
+        self.assertTrue(ok, why)
+        self.assertEqual(self.mod.git("rev-parse", "HEAD", cwd=wt).stdout.strip(), head)
+        self.assertEqual(self.mod.git("branch", "--show-current", cwd=wt).stdout.strip(), "worktree/wt1")
+        self.assertTrue(os.path.isfile(os.path.join(wt, "plan.md")))
+
+    def test_removed_worktree_without_base_fails_cleanly(self):
+        cfg = dict(self.cfg)
+        cfg["park_archive_dir"] = os.path.join(self.tmp, "arch", "{repo_key}")
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        with redirect_stderr(io.StringIO()):
+            ok, why = self.mod.unpark(cfg, repo + cfg["worktree_marker"] + "wt1", False)
+        self.assertFalse(ok)
+        self.assertIn("no parked branch or base commit", why)

@@ -28,8 +28,14 @@ def path_matches(row_path, w):
     return rp == w or rp.startswith(w.rstrip("/") + "/")
 
 
-def row_holds(row, now, cfg, alive_fn):
-    """Reason string when this row holds its cwd, else None."""
+def row_holds(row, now, cfg, alive_fn, guids_fn=lambda: None):
+    """Reason string when this row holds its cwd, else None.
+
+    A parked session whose iTerm2 tab still exists holds with no expiry: that tab will
+    resume here whenever it is clicked, however long it sat. When iTerm2 cannot be asked
+    (guids_fn() is None) a parked row with a known tab holds too (fail closed). Only a
+    parked row whose tab is gone (or never recorded) falls back to hibernate_keep_days.
+    """
     keep_s = float(cfg["hibernate_keep_days"]) * 86400
     age_s = float(cfg["session_age_days"]) * 86400
     if row.get("ended_at") is None and alive_fn(row):
@@ -38,6 +44,13 @@ def row_holds(row, now, cfg, alive_fn):
         ev = row.get("evicted_at")
         if ev is None or now - ev <= keep_s:
             return "hibernated session %s" % row["session_id"][:8]
+        guid = row.get("iterm_guid")
+        if guid:
+            live = guids_fn()
+            if live is None:
+                return "hibernated session %s, iTerm2 tabs unreadable (fail closed)" % row["session_id"][:8]
+            if guid in live:
+                return "hibernated session %s, its tab is still open" % row["session_id"][:8]
     le = row.get("last_event_at")
     if le is not None and now - le <= age_s:
         return "session %s active within %sd" % (row["session_id"][:8], cfg["session_age_days"])
@@ -57,7 +70,7 @@ def transcript_recent(path, cfg, now):
     return None
 
 
-def holds(path, cfg, now=None, alive_fn=None):
+def holds(path, cfg, now=None, alive_fn=None, guids_fn=None):
     """(code, reason)."""
     now = time.time() if now is None else now
     w = os.path.realpath(path)
@@ -69,10 +82,20 @@ def holds(path, cfg, now=None, alive_fn=None):
         return UNREADABLE, "ledger unreadable: %s" % exc
     if alive_fn is None:
         alive_fn = lambda r: procs.identity_alive(r.get("pid"), r.get("pid_start"))
+    if guids_fn is None:
+        from .restore import iterm_guids
+        guids_fn = iterm_guids
+    cache = []
+
+    def guids_once():
+        if not cache:
+            cache.append(guids_fn())
+        return cache[0]
+
     for r in rows:
         if not (path_matches(r.get("cwd"), w) or path_matches(r.get("launch_cwd"), w)):
             continue
-        why = row_holds(r, now, cfg, alive_fn)
+        why = row_holds(r, now, cfg, alive_fn, guids_once)
         if why:
             return HELD, why
     why = transcript_recent(path, cfg, now)

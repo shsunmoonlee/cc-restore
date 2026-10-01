@@ -13,7 +13,10 @@ parked branch exists, undoes the park first:
                                         <park_branch_prefix><name>)
   2. git reset HEAD~1 when the tip is the park commit (mixed: the changes stay)
   3. copy <archive>/<name>/files/ back without overwriting
-then execs `claude --resume <id>` there. Nothing here deletes.
+When no branch survives (the sweeper removed the worktree and deleted its branch), step 1
+is `git worktree add -b <park_branch_prefix><name> <cwd> <base>` instead, with <base> the
+MANIFEST.md HEAD when that commit exists, else origin's default branch.
+Then execs `claude --resume <id>` there. Nothing here deletes.
 
 Refuses (exit 1) when the ledger shows the session's process still running. Before exec
 it writes its own identity (pid + start) and state `resuming` into the row (tolerating a
@@ -95,6 +98,24 @@ def parked_branch(cfg, repo, name):
     return None, arch
 
 
+def removed_base(arch, repo):
+    """Commit to recreate a removed worktree at: the archived HEAD, else origin's default."""
+    try:
+        with open(os.path.join(arch, "MANIFEST.md"), errors="replace") as fh:
+            m = re.search(r"^- HEAD:\s+([0-9a-f]{7,40})\b", fh.read(), re.M)
+        if m and git("cat-file", "-e", m.group(1) + "^{commit}", cwd=repo).returncode == 0:
+            return m.group(1)
+    except OSError:
+        pass
+    r = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", cwd=repo)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    for b in ("origin/main", "origin/master"):
+        if git("rev-parse", "--verify", "--quiet", b, cwd=repo).returncode == 0:
+            return b
+    return None
+
+
 def unpark(cfg, cwd, dry):
     marker = cfg["worktree_marker"]
     repo, name = cwd.split(marker, 1)
@@ -103,15 +124,25 @@ def unpark(cfg, cwd, dry):
     if not os.path.isdir(repo):
         return False, "repo %s is gone" % repo
     branch, arch = parked_branch(cfg, repo, name)
-    if not branch:
-        return False, "no parked branch for %s (merged, or removed); see %s" % (
-            name, os.path.join(arch, "MANIFEST.md"))
-    say("worktree %s was parked; restoring it from branch %s" % (name, branch))
+    if branch:
+        say("worktree %s was parked; restoring it from branch %s" % (name, branch))
+        add = ["worktree", "add", wt, branch]
+    else:
+        # Removed, not parked: the sweep only does that when every commit is safe on the
+        # default branch or origin, so a fresh branch at the archived HEAD (else the
+        # default branch) gives the session a working cwd again.
+        base = removed_base(arch, repo)
+        if not base:
+            return False, "no parked branch or base commit for %s; see %s" % (
+                name, os.path.join(arch, "MANIFEST.md"))
+        branch = cfg["park_branch_prefix"] + name
+        say("worktree %s was removed; recreating it on new branch %s at %s" % (name, branch, base))
+        add = ["worktree", "add", "-b", branch, wt, base]
     if dry:
         return True, "dry-run"
-    r = git("worktree", "add", wt, branch, cwd=repo)
+    r = git(*add, cwd=repo)
     if r.returncode != 0 and "missing but already registered" in r.stderr:
-        r = git("worktree", "add", "-f", wt, branch, cwd=repo)
+        r = git(*(add[:2] + ["-f"] + add[2:]), cwd=repo)
     if r.returncode != 0:
         return False, ("git worktree add failed: %s\n  recover by hand: git -C %s worktree add %s %s"
                        % (r.stderr.strip(), shlex.quote(repo), shlex.quote(wt), shlex.quote(branch)))

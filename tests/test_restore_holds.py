@@ -95,8 +95,8 @@ class RestoreSelect(TempEnv):
 
 
 class Holds(TempEnv):
-    def h(self, path, alive=lambda r: False, now=None):
-        return holds.holds(path, self.cfg, now=now, alive_fn=alive)
+    def h(self, path, alive=lambda r: False, now=None, guids=lambda: set()):
+        return holds.holds(path, self.cfg, now=now, alive_fn=alive, guids_fn=guids)
 
     def setUp(self):
         super().setUp()
@@ -131,6 +131,22 @@ class Holds(TempEnv):
                     last_event_at=now - 50 * 86400, ended_at=None)
         self.assertEqual(self.h(self.w)[0], holds.HELD)
         self.assertEqual(self.h(self.w, now=now + 20 * 86400)[0], holds.FREE)
+
+    def test_hibernated_open_tab_holds_past_keep(self):
+        now = time.time()
+        self.insert(cwd=self.w, state="hibernated", evicted_at=now - 400 * 86400,
+                    last_event_at=now - 400 * 86400, ended_at=None, iterm_guid="w0t0p0:ABCDEF12")
+        self.assertEqual(self.h(self.w, guids=lambda: {"w0t0p0:ABCDEF12"})[0], holds.HELD)
+        self.assertEqual(self.h(self.w, guids=lambda: {"w9t9p9:OTHER999"})[0], holds.FREE)
+        self.assertEqual(self.h(self.w, guids=lambda: None)[0], holds.HELD)
+
+    def test_hibernated_no_guid_expires(self):
+        now = time.time()
+        self.insert(cwd=self.w, state="hibernated", evicted_at=now - 400 * 86400,
+                    last_event_at=now - 400 * 86400, ended_at=None)
+        called = []
+        self.assertEqual(self.h(self.w, guids=lambda: called.append(1))[0], holds.FREE)
+        self.assertEqual(called, [])
 
     def test_old_ended_row_does_not_hold(self):
         now = time.time()
