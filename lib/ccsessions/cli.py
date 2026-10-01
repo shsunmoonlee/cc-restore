@@ -16,7 +16,7 @@ SAFE_SID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 def log_line(cfg, msg):
     try:
-        path = cfg.path("log") if cfg else os.path.expanduser(config.DEFAULTS["log"])
+        path = cfg.path("log") if cfg else config.log_path()
         d = os.path.dirname(path)
         if d and not os.path.isdir(d):
             os.makedirs(d, exist_ok=True)
@@ -235,7 +235,7 @@ def cmd_restore(cfg, a):
     from . import restore
     conn = _open(cfg)
     return restore.run(cfg, conn, auto=a.auto, dry_run=a.dry_run, limit=a.limit,
-                       include_hibernated=a.include_hibernated)
+                       include_hibernated=a.include_hibernated, max_age_days=a.max_age_days)
 
 
 def cmd_import_legacy(cfg, a):
@@ -258,6 +258,83 @@ def settings_hook_events(settings_path):
     return found
 
 
+DAEMON_FRESH_S = 120
+RESTART_LOOP_WINDOW_S = 300
+RESTART_LOOP_STARTS = 3
+BLIND_WARN_S = 300
+
+
+def _meta_float(conn, key):
+    from . import ledger
+    try:
+        v = ledger.get_meta(conn, key)
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pid_running(conn, alive):
+    from . import ledger
+    pid = ledger.get_meta(conn, "pid")
+    try:
+        running = bool(pid) and alive(int(pid))
+    except (TypeError, ValueError):
+        running = False
+    return pid, running
+
+
+def daemon_checks(conn, now=None, alive=None):
+    """[(status, name, detail)] from the daemon's meta rows. `heartbeat` = last completed
+    tick; `liveness` = the daemon process is running (written at startup and on every
+    connect attempt); `connected_at` = last good iTerm2 connect (which clears `last_error`);
+    `last_error` / `last_exit_at` = why and when it last gave up."""
+    from . import ledger, procs
+    now = time.time() if now is None else now
+    alive = alive or procs.pid_alive
+    out = []
+    hb, lv = _meta_float(conn, "heartbeat"), _meta_float(conn, "liveness")
+    hb_age = now - hb if hb is not None else None
+    err = ledger.get_meta(conn, "last_error")
+    exit_at = _meta_float(conn, "last_exit_at")
+    connected_at = _meta_float(conn, "connected_at")
+    try:
+        starts = [float(t) for t in json.loads(ledger.get_meta(conn, "recent_starts") or "[]")]
+    except (TypeError, ValueError):
+        starts = []
+    tick = "never" if hb_age is None else "%ds ago" % hb_age
+    if connected_at is not None and (exit_at is None or connected_at > exit_at):
+        link = "connected since %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(connected_at))
+    else:
+        since = max([t for t in (hb, exit_at) if t is not None] or starts[-1:] or [lv or now])
+        link = "disconnected since %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
+    if hb_age is not None and hb_age < DAEMON_FRESH_S:
+        out.append(("PASS", "daemon heartbeat", "%ds ago" % hb_age))
+    elif lv is not None and now - lv < DAEMON_FRESH_S:
+        pid, running = _pid_running(conn, alive)
+        out.append(("FAIL", "daemon heartbeat", "daemon pid %s %s, last tick %s, %s: %s" % (
+            pid or "?", "alive" if running else "not running", tick, link, err or "no error recorded")))
+    else:
+        pid, running = _pid_running(conn, alive)
+        if running:
+            detail = "daemon pid %s alive but unresponsive: no liveness for %s, last tick %s, %s" % (
+                pid, "ever" if lv is None else "%ds" % (now - lv), tick, link)
+        else:
+            detail = "daemon not running (pid %s), last tick %s" % (pid or "?", tick)
+        if err:
+            detail += "; last error: %s" % err
+        out.append(("FAIL", "daemon heartbeat", detail))
+    blind = _meta_float(conn, "blind_since")
+    if blind is not None and now - blind > BLIND_WARN_S:
+        out.append(("WARN", "iTerm2 snapshot", "every session's tty read has failed for %d min "
+                    "(%s skipped): focus tracking is blind" % (
+                        (now - blind) // 60, ledger.get_meta(conn, "skipped_sessions") or "?")))
+    recent = [t for t in starts if now - t < RESTART_LOOP_WINDOW_S]
+    if len(recent) >= RESTART_LOOP_STARTS:
+        out.append(("WARN", "daemon restarts", "%d starts in the last %d min (restart loop?); last error: %s" % (
+            len(recent), RESTART_LOOP_WINDOW_S // 60, err or "none recorded")))
+    return out
+
+
 def doctor_checks(cfg):
     """[(status, name, detail)] with status PASS | WARN | FAIL."""
     import subprocess
@@ -272,17 +349,21 @@ def doctor_checks(cfg):
         conn = ledger.connect(cfg.path("db"))
         v = conn.execute("PRAGMA user_version").fetchone()[0]
         out.append(("PASS" if v == SCHEMA_VERSION else "FAIL", "ledger", "%s schema %s" % (cfg.path("db"), v)))
-        hb = ledger.get_meta(conn, "heartbeat")
-        age = time.time() - float(hb) if hb else None
-        out.append(("PASS" if age is not None and age < 120 else "FAIL", "daemon heartbeat",
-                    "never" if age is None else "%ds ago" % age))
+        out.extend(daemon_checks(conn))
     except Exception as exc:
         out.append(("FAIL", "ledger", str(exc)))
     try:
         evs = settings_hook_events(cfg.path("claude_settings"))
         missing = [e for e in REQUIRED_HOOK_EVENTS if e not in evs]
-        out.append(("FAIL" if missing else "PASS", "hooks",
-                    ("missing: " + ", ".join(missing)) if missing else "all %d events wired" % len(REQUIRED_HOOK_EVENTS)))
+        expected = REQUIRED_HOOK_EVENTS + OPTIONAL_HOOK_EVENTS
+        wired = [e for e in expected if e in evs]
+        if missing:
+            detail = "missing: " + ", ".join(missing)
+        elif len(wired) == len(expected):
+            detail = "all %d events wired" % len(expected)
+        else:
+            detail = "%d of %d events wired (all required)" % (len(wired), len(expected))
+        out.append(("FAIL" if missing else "PASS", "hooks", detail))
         for e in OPTIONAL_HOOK_EVENTS:
             if e not in evs:
                 out.append(("WARN", "hooks", "%s not wired (optional)" % e))
@@ -386,6 +467,8 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int)
     p.add_argument("--include-hibernated", action="store_true")
+    p.add_argument("--max-age-days", type=int, metavar="N",
+                   help="override restore_max_age_days (0 = no limit)")
     p = sub.add_parser("import-legacy", help="one-time import of v1 manifests + live registry")
     p.add_argument("--manifests")
     p.add_argument("--registry")

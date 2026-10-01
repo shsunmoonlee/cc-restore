@@ -1,6 +1,8 @@
 """Configuration: ~/.config/cc-sessions/config.json, every key optional.
 
-CC_SESSIONS_CONFIG overrides the config path, CC_SESSIONS_DB overrides the db path.
+CC_SESSIONS_CONFIG overrides the config path, CC_SESSIONS_DB overrides the db path,
+CC_SESSIONS_LOG overrides the log path (the test suite sets it so nothing it runs, a hook
+subprocess included, can ever write to the real log).
 A config file that exists but does not parse forces dry_run on (fail closed): a typo in
 the file must never turn a dry-run daemon live.
 """
@@ -94,7 +96,14 @@ def load(path=None):
         cfg["dry_run"] = True
     if os.environ.get("CC_SESSIONS_DB"):
         cfg["db"] = os.environ["CC_SESSIONS_DB"]
+    if os.environ.get("CC_SESSIONS_LOG"):
+        cfg["log"] = os.environ["CC_SESSIONS_LOG"]
     return cfg
+
+
+def log_path():
+    """The log path when no config could be loaded (CC_SESSIONS_LOG, else the default)."""
+    return expand(os.environ.get("CC_SESSIONS_LOG") or DEFAULTS["log"])
 
 
 def db_dir(cfg):

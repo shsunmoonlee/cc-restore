@@ -8,7 +8,11 @@ Candidates come from the ledger, never from Claude Code's own registry:
     from T while consecutive ended_at values are within 30 s of each other.
 A deliberate exit (/exit, Ctrl-D: reason prompt_input_exit, clear, logout...) is never
 restored. Hibernated rows are left alone unless --include-hibernated, or --auto finds
-their tab gone; those tabs get the resume command typed but not run.
+their tab gone; those tabs get the resume command typed but not run. A hibernated row
+whose tab is still open is never reopened (that would be a second tab for one session).
+With --include-hibernated (never under --auto), a typed row whose worktree cwd is gone
+but whose git repo still exists is kept: cc-resume rebuilds it. Every other row with a
+missing cwd is skipped.
 """
 import os
 import re
@@ -20,6 +24,27 @@ from . import PARKED_STATES, SUPERSEDED, procs, resumecmd
 CLUSTER_ANCHOR_S = 300
 CLUSTER_GAP_S = 30
 BLIND = "hibernated (iTerm2 tabs unknown)"
+TAB_OPEN = "hibernated (tab still open: focus it or `cc-sessions wake`)"
+
+
+def rebuildable_worktree(cfg, cwd, isdir=os.path.isdir):
+    """True when cwd is a worktree path (contains worktree_marker) whose git repo still
+    exists, so cc-resume can rebuild a parked or removed worktree."""
+    marker = cfg.get("worktree_marker")
+    if not cwd or not marker or marker not in cwd:
+        return False
+    repo = cwd.split(marker, 1)[0]
+    return bool(repo) and isdir(repo) and os.path.exists(os.path.join(repo, ".git"))
+
+
+def max_age_s(cfg, auto=False, max_age_days=None):
+    """Seconds; 0 (or less) days = no limit. --auto never looks back less than 30 days, and
+    only an explicit --max-age-days 0 lifts its limit (a config 0 keeps the 30-day floor)."""
+    explicit = max_age_days is not None
+    days = float(max_age_days if explicit else cfg.get("restore_max_age_days", 7))
+    if days <= 0 and (explicit or not auto):
+        return float("inf")
+    return max(days, 30) * 86400 if auto else days * 86400
 
 
 def shutdown_cluster(rows, boot):
@@ -42,12 +67,10 @@ def shutdown_cluster(rows, boot):
 
 
 def select(rows, boot, now, cfg, alive_fn, auto=False, include_hibernated=False,
-           live_guids=None, isdir=os.path.isdir):
+           live_guids=None, isdir=os.path.isdir, max_age_days=None):
     """-> (run, typed, skipped): run/typed are rows, skipped is [(row, reason)]."""
     cluster = shutdown_cluster(rows, boot) if boot else set()
-    max_age = float(cfg.get("restore_max_age_days", 7)) * 86400
-    if auto:
-        max_age = max(max_age, 30 * 86400)
+    max_age = max_age_s(cfg, auto, max_age_days)
     run, typed, skipped = [], [], []
     for r in sorted(rows, key=lambda r: r.get("last_event_at") or 0):
         st = r.get("state")
@@ -65,6 +88,9 @@ def select(rows, boot, now, cfg, alive_fn, auto=False, include_hibernated=False,
         bucket = None
         if st in PARKED_STATES:
             if include_hibernated:
+                if live_guids is not None and r.get("iterm_guid") in live_guids:
+                    skipped.append((r, TAB_OPEN))
+                    continue
                 bucket = typed
             elif not auto:
                 skipped.append((r, "hibernated"))
@@ -95,7 +121,9 @@ def select(rows, boot, now, cfg, alive_fn, auto=False, include_hibernated=False,
         if now - last > max_age:
             skipped.append((r, "older than %dd" % (max_age / 86400)))
             continue
-        if not r.get("cwd") or not isdir(r["cwd"]):
+        cwd = r.get("cwd")
+        rebuild = not auto and bucket is typed and rebuildable_worktree(cfg, cwd, isdir)
+        if not cwd or not (isdir(cwd) or rebuild):
             skipped.append((r, "cwd gone: %s" % r.get("cwd")))
             continue
         bucket.append(r)
@@ -136,7 +164,9 @@ def valid_guids(stdout, n):
 
 def iterm_guids():
     """Set of live iTerm2 session GUIDs, or None when iTerm2 cannot be asked."""
-    if subprocess.run(["pgrep", "-xq", "iTerm2"]).returncode != 0:
+    # -a: macOS pgrep skips its own ancestors by default, and iTerm2 is an ancestor of
+    # every shell in an iTerm2 tab
+    if subprocess.run(["pgrep", "-axq", "iTerm2"]).returncode != 0:
         return None
     script = ('tell application "iTerm2"\nset o to ""\nrepeat with w in windows\n'
               'repeat with t in tabs of w\nrepeat with s in sessions of t\n'
@@ -151,7 +181,8 @@ def iterm_guids():
     return {l.strip() for l in r.stdout.splitlines() if l.strip()}
 
 
-def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=False, out=print):
+def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=False, out=print,
+        max_age_days=None):
     from .ledger import all_rows
     limit = limit or int(cfg.get("restore_limit", 40))
     boot = procs.boot_time()
@@ -172,9 +203,13 @@ def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=Fal
                 fh.write(str(boot))
 
     alive = lambda r: procs.identity_alive(r.get("pid"), r.get("pid_start"))
-    guids = iterm_guids() if auto else None
+    guids = iterm_guids() if (auto or include_hibernated) else None
+    if include_hibernated and not auto and guids is None:
+        out("warning: iTerm2 tabs could not be listed; a hibernated session whose tab is "
+            "still open gets a second tab")
     runs, typed, skipped = select(all_rows(conn), boot, time.time(), cfg, alive, auto=auto,
-                                  include_hibernated=include_hibernated, live_guids=guids)
+                                  include_hibernated=include_hibernated, live_guids=guids,
+                                  max_age_days=max_age_days)
     blind = auto and any(why == BLIND for _, why in skipped)
     if blind:
         out("iTerm2 tabs could not be listed: hibernated sessions skipped; the boot marker "
@@ -192,10 +227,12 @@ def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=Fal
     if len(tabs) > limit:
         out("%d sessions exceeds --limit %d; raise it if intentional." % (len(tabs), limit))
         return 1
+    def note(r):
+        return "  (worktree will be rebuilt)" if not os.path.isdir(r["cwd"]) else ""
     for r in runs:
-        out("  open  %s  %s  %s" % (r["session_id"][:8], r["cwd"], (r.get("title") or "")[:50]))
+        out("  open  %s  %s  %s%s" % (r["session_id"][:8], r["cwd"], (r.get("title") or "")[:50], note(r)))
     for r in typed:
-        out("  typed %s  %s  %s" % (r["session_id"][:8], r["cwd"], (r.get("title") or "")[:50]))
+        out("  typed %s  %s  %s%s" % (r["session_id"][:8], r["cwd"], (r.get("title") or "")[:50], note(r)))
     if dry_run:
         out("dry-run: would open %d tabs." % len(tabs))
         return 0

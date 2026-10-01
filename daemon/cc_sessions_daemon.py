@@ -22,6 +22,7 @@ import logging
 import logging.handlers
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -53,7 +54,10 @@ PRUNE_EVERY_S = 3600
 ON_EVICT_TIMEOUT_S = 30
 MAX_ABORTS_PER_PASS = 3
 ITERM_CALL_TIMEOUT_S = 5
+APP_CONNECT_TIMEOUT_S = ITERM_CALL_TIMEOUT_S * 3
 CANCEL_WAIT_S = 5
+OUT_LOG_CAP = 5 * 1024 * 1024
+RECENT_STARTS = 10
 TTY_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
              "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[<u\x1b[?7h\x1b[0m\x1b>")
 
@@ -180,7 +184,7 @@ def is_shell_job(job):
 
 
 class ConnectionLost(Exception):
-    """The iTerm2 connection is gone or unresponsive: leave the loops and reconnect."""
+    """The iTerm2 connection is gone or unresponsive: leave the loops and exit (launchd restarts)."""
 
 
 async def iterm_call(aw, what):
@@ -370,6 +374,9 @@ class Evictor(object):
                 why = recheck(row)
                 if asyncio.iscoroutine(why):
                     why = await why
+            except ConnectionLost as exc:
+                self._abort(row, eid, "re-check: connection lost: %s" % exc)
+                raise
             except Exception as exc:
                 why = "re-check failed: %s" % exc
             if why:
@@ -653,6 +660,15 @@ def iterm_running():
     return r.stdout.strip() == "true"
 
 
+API_DISABLED_RETRY_S = 600
+API_DISABLED_CHUNK_S = 60  # liveness is written before each chunk (doctor: DAEMON_FRESH_S 120)
+
+
+def api_disabled(exc):
+    """True when a cookie request failed because iTerm2's Python API is switched off."""
+    return "not enabled" in str(exc).lower()
+
+
 def request_cookie():
     """ITERM2_COOKIE/ITERM2_KEY via AppleScript, 10 s timeout. Raises on failure."""
     r = subprocess.run(["osascript", "-e", 'tell application id "com.googlecode.iterm2" to '
@@ -716,22 +732,75 @@ class ItermTabs(object):
         return s.session_id
 
 
+class _NoRPCException(Exception):
+    """Stands in for iterm2.rpc.RPCException when the iterm2 package is not loaded."""
+
+
+def _rpc_exception():
+    """From the already-loaded package (main() imports iterm2 before any snapshot); never
+    imports it, so this module stays importable and testable without iterm2."""
+    return getattr(sys.modules.get("iterm2.rpc"), "RPCException", None) or _NoRPCException
+
+
+_last_skipped = frozenset()
+
+
+async def _session_tty(s, rpc_exc, skipped=None):
+    """A session closed between listing and asking answers with an RPCException: skip it
+    (recorded in `skipped` as {guid: reason}; focus_snapshot logs the set when it changes)."""
+    try:
+        return procs.norm_tty(await s.async_get_variable("tty"))
+    except rpc_exc as exc:
+        if skipped is not None:
+            skipped[getattr(s, "session_id", "?")] = str(exc)
+        return None
+
+
+def _log_skipped(skipped):
+    global _last_skipped
+    now = frozenset(skipped)
+    if now != _last_skipped:
+        if now:
+            log.info("focus snapshot: skipping %d session(s): %s", len(now),
+                     ", ".join("%s (%s)" % (g, skipped[g]) for g in sorted(now)))
+        else:
+            log.info("focus snapshot: no sessions skipped")
+        _last_skipped = now
+
+
 async def focus_snapshot(app):
-    """{tty_guid: {tty: guid}, visible_ttys: set, visible_guids: set}. Visible = every
-    pane of each window's current tab."""
-    tty_guid, visible, vguids = {}, set(), set()
+    """{tty_guid: {tty: guid}, visible_ttys: set, visible_guids: set, panes: int,
+    skipped: int}. Visible = every pane of each window's current tab. The tty reads run
+    concurrently; `skipped` counts panes whose tty read raised an RPCException."""
+    rpc_exc = _rpc_exception()
+    panes = []
     for w in app.terminal_windows:
         cur = w.current_tab
         for t in w.tabs:
+            shown = cur is not None and t.tab_id == cur.tab_id
             for s in t.sessions:
-                tty = procs.norm_tty(await s.async_get_variable("tty"))
-                if tty:
-                    tty_guid[tty] = s.session_id
-                if cur is not None and t.tab_id == cur.tab_id:
-                    vguids.add(s.session_id)
-                    if tty:
-                        visible.add(tty)
-    return {"tty_guid": tty_guid, "visible_ttys": visible, "visible_guids": vguids}
+                panes.append((s, shown))
+    # return_exceptions: every read finishes (none left running or unretrieved) before the
+    # first non-RPCException failure, in pane order, propagates.
+    skipped = {}
+    ttys = await asyncio.gather(*[_session_tty(s, rpc_exc, skipped) for s, _ in panes],
+                                return_exceptions=True)
+    for tty in ttys:
+        if isinstance(tty, BaseException) and not isinstance(tty, rpc_exc):
+            raise tty
+    _log_skipped(skipped)
+    tty_guid, visible, vguids = {}, set(), set()
+    for (s, shown), tty in zip(panes, ttys):
+        if isinstance(tty, BaseException):
+            tty = None
+        if tty:
+            tty_guid[tty] = s.session_id
+        if shown:
+            vguids.add(s.session_id)
+            if tty:
+                visible.add(tty)
+    return {"tty_guid": tty_guid, "visible_ttys": visible, "visible_guids": vguids,
+            "panes": len(panes), "skipped": len(skipped)}
 
 
 class Daemon(object):
@@ -750,6 +819,8 @@ class Daemon(object):
         self.last_said = None
         self.last_pick = None
         self.visible = {}  # tty -> guid shown right now
+        self.blind_since = None
+        self.last_blind_meta = None
 
     async def off(self, fn, *args):
         """Blocking work (ps, transcript reads, stats) in an executor; SQLite stays here."""
@@ -759,10 +830,44 @@ class Daemon(object):
         return _as_state(await self.off(procs.identity_probe, row.get("pid"), row.get("pid_start")))
 
     async def snapshot(self):
+        """A slow snapshot on a live connection is a plain TimeoutError, so tick_loop's
+        consecutive-failure rule decides; only a closed websocket is ConnectionLost."""
         try:
-            return await asyncio.wait_for(focus_snapshot(self.app), self.SNAPSHOT_TIMEOUT_S)
+            focus = await asyncio.wait_for(focus_snapshot(self.app), self.SNAPSHOT_TIMEOUT_S)
         except asyncio.TimeoutError:
-            raise ConnectionLost("iTerm2 did not answer a focus snapshot in %ss" % self.SNAPSHOT_TIMEOUT_S)
+            what = "iTerm2 did not answer a focus snapshot in %ss" % self.SNAPSHOT_TIMEOUT_S
+            if not connection_alive(self.connection):
+                raise ConnectionLost(what)
+            raise TimeoutError(what)
+        self.record_blindness(focus)
+        return focus
+
+    def record_blindness(self, focus, now=None):
+        """meta `skipped_sessions` = panes the last snapshot could not read; `blind_since` =
+        when every pane (of at least one) started being skipped, "" once any pane reads.
+        Written only on change; doctor warns on a long blind spell."""
+        panes, skipped = focus.get("panes", 0), focus.get("skipped", 0)
+        blind = panes > 0 and skipped == panes
+        if blind and self.blind_since is None:
+            self.blind_since = time.time() if now is None else now
+        elif not blind:
+            self.blind_since = None
+        state = (skipped, self.blind_since)
+        if state == self.last_blind_meta:
+            return
+        values = {"skipped_sessions": skipped,
+                  "blind_since": "" if self.blind_since is None else self.blind_since}
+        try:
+            if self.conn.in_transaction:
+                for k, v in values.items():
+                    ledger.set_meta(self.conn, k, v)
+            else:
+                with ledger.tx(self.conn):
+                    for k, v in values.items():
+                        ledger.set_meta(self.conn, k, v)
+            self.last_blind_meta = state
+        except Exception:
+            log.exception("could not record snapshot blindness")
 
     def stamp_visibility(self, focus, now=None):
         """last_focus_at = now for rows shown now AND rows that were shown until now."""
@@ -1049,7 +1154,7 @@ class Daemon(object):
 
     async def run_loops(self, loops=None):
         """Run focus, tick and request loops; the first one to fail cancels the others and
-        its exception propagates, so main() reconnects with backoff instead of hanging."""
+        its exception propagates, so main() exits for a clean restart instead of hanging."""
         coros = loops or (self.focus_loop(), self.tick_loop(), self.request_loop())
         tasks = [asyncio.ensure_future(c) for c in coros]
         try:
@@ -1065,7 +1170,7 @@ class Daemon(object):
                 raise t.exception()
         stuck = [t for t in tasks if not t.done()]
         if stuck:
-            log.warning("%d loop(s) did not finish cancelling within %ss; reconnecting anyway",
+            log.warning("%d loop(s) did not finish cancelling within %ss; exiting anyway",
                         len(stuck), CANCEL_WAIT_S)
         raise ConnectionLost("daemon loops ended")
 
@@ -1085,6 +1190,95 @@ def setup_logging(cfg, stderr=False):
     h = logging.handlers.RotatingFileHandler(path, maxBytes=1000000, backupCount=3)
     h.setFormatter(fmt)
     log.addHandler(h)
+
+
+def trim_stdio(cap=OUT_LOG_CAP, fds=(1, 2)):
+    """launchd points stdout/stderr at one never-rotated file, and the iterm2 package prints
+    tracebacks there. Truncate it at startup when it is over `cap`. Works on the inherited
+    descriptors (no path needed); pipes and ttys are left alone. -> bytes dropped."""
+    seen, dropped = set(), 0
+    for fd in fds:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) in seen:
+            continue
+        seen.add((st.st_dev, st.st_ino))
+        if st.st_size <= cap:
+            continue
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, ("%s cc-sessions: truncated %d bytes of daemon output at startup\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), st.st_size)).encode())
+            dropped += st.st_size
+        except OSError:
+            pass
+    return dropped
+
+
+def record_meta(conn, **values):
+    """Best effort: a ledger write must never stop the daemon from starting or exiting."""
+    try:
+        with ledger.tx(conn):
+            for k, v in values.items():
+                ledger.set_meta(conn, k, v)
+    except Exception:
+        log.exception("could not record %s in the ledger", ", ".join(sorted(values)))
+
+
+def sleep_alive(conn, total, chunk):
+    """Sleep `total` seconds in `chunk`-second pieces, writing liveness before each, so a
+    long pre-connect wait never reads as an unresponsive daemon."""
+    left = total
+    while left > 0:
+        step = min(chunk, left)
+        record_meta(conn, liveness=time.time())
+        time.sleep(step)
+        left -= step
+
+
+def record_start(conn, now=None):
+    """starts += 1, pid, recent_starts (last RECENT_STARTS start times, for doctor's
+    restart-loop warning), liveness. Clears blind_since / skipped_sessions: a value left by
+    an earlier process must not drive doctor's blind-snapshot warning."""
+    now = time.time() if now is None else now
+    try:
+        n = int(ledger.get_meta(conn, "starts") or 0)
+    except (ValueError, TypeError):
+        n = 0
+    try:
+        recent = [float(t) for t in json.loads(ledger.get_meta(conn, "recent_starts") or "[]")]
+    except (ValueError, TypeError):
+        recent = []
+    recent = (recent + [now])[-RECENT_STARTS:]
+    record_meta(conn, starts=n + 1, pid=os.getpid(), recent_starts=json.dumps(recent), liveness=now,
+                blind_since="", skipped_sessions=0)
+
+
+async def run_connected(connection, cfg, conn, dry_run, get_app, failure=None):
+    """The coroutine handed to iterm2.run_until_complete. A dead connection from an earlier
+    run in this process can leave the library's App singleton (and its notification
+    handlers) behind; never run on top of it. The library turns any exception into a
+    printed traceback + sys.exit(1), so the reason is kept in `failure["error"]`.
+    Getting the App is bounded: iTerm2 can accept the websocket and never answer.
+    A good connect records `connected_at` and clears `last_error`: whatever the error was,
+    it is resolved now, and any later failure records a fresh one on exit."""
+    try:
+        try:
+            app = await asyncio.wait_for(get_app(connection), APP_CONNECT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise ConnectionLost("iTerm2 did not answer the App setup within %ss" % APP_CONNECT_TIMEOUT_S)
+        if getattr(app, "connection", None) is not connection:
+            raise ConnectionLost("stale App singleton")
+        d = Daemon(cfg, conn, app, connection, dry_run)
+        log.info("connected to iTerm2")
+        record_meta(conn, connected_at=time.time(), last_error="")
+        await d.run_loops()
+    except Exception as exc:
+        if failure is not None:
+            failure["error"] = "%s: %s" % (type(exc).__name__, exc)
+        raise
 
 
 def take_lock(cfg):
@@ -1159,37 +1353,62 @@ def main(argv=None):
     if lock is None:
         log.info("another daemon holds the lock; exiting")
         return 0
+    dropped = trim_stdio()
+    if dropped:
+        log.warning("daemon output file was %d bytes; truncated", dropped)
     conn = ledger.connect(cfg.path("db"))
+    record_start(conn)
     fixed = reconcile(conn, probe_rows(ledger.all_rows(conn, "state=?", (EVICTING,))))
     for sid, old, new in fixed:
         log.info("startup: %s %s -> %s", sid[:8], old, new)
     log.info("daemon start (dry_run=%s, pid %d)", dry_run, os.getpid())
+    # Before the first connection attempt no iterm2 library state exists, so waiting here
+    # for iTerm2 (or for its cookie) is safe. Once run_until_complete has been entered the
+    # library keeps process-global state (the App singleton, notification handlers) that a
+    # lost connection leaves dirty, so any end of the connection exits and launchd
+    # (KeepAlive) starts a clean process.
     delays = backoff_delays()
-    first = True
+    use_env_cookie = bool(os.environ.get("ITERM2_COOKIE"))
     while True:
-        started = time.time()
+        record_meta(conn, liveness=time.time())
         try:
             if not iterm_running():
                 raise RuntimeError("iTerm2 is not running")
-            if not first or not os.environ.get("ITERM2_COOKIE"):
+            if not use_env_cookie:
                 os.environ.pop("ITERM2_COOKIE", None)
                 os.environ.pop("ITERM2_KEY", None)
                 request_cookie()
-            first = False
-
-            async def run(connection):
-                app = await iterm2.async_get_app(connection)
-                d = Daemon(cfg, conn, app, connection, dry_run)
-                log.info("connected to iTerm2")
-                await d.run_loops()
-            iterm2.run_until_complete(run, retry=False)
-            log.warning("iTerm2 connection ended")
-        except (Exception, SystemExit) as exc:  # the iterm2 package sys.exit()s on errors
-            log.warning("iTerm2 connection failed: %s", exc)
-        first = False
-        if time.time() - started > 300:
-            delays = backoff_delays()
-        time.sleep(next(delays))
+            break
+        except Exception as exc:
+            use_env_cookie = False
+            if api_disabled(exc):
+                # each cookie request pops iTerm2's enable-the-API alert: ask rarely
+                log.warning("iTerm2's Python API is not enabled; retrying in %ds: %s",
+                            API_DISABLED_RETRY_S, exc)
+                record_meta(conn, last_error="iTerm2 Python API not enabled (Settings > General > "
+                            "Magic > Enable Python API); retrying every %ds: %s" % (API_DISABLED_RETRY_S, exc))
+                sleep_alive(conn, API_DISABLED_RETRY_S, API_DISABLED_CHUNK_S)
+                continue
+            log.warning("waiting for iTerm2: %s", exc)
+            record_meta(conn, last_error="waiting for iTerm2: %s" % exc)
+            time.sleep(next(delays))
+    record_meta(conn, liveness=time.time())
+    failure = {}
+    try:
+        iterm2.run_until_complete(
+            functools.partial(run_connected, cfg=cfg, conn=conn, dry_run=dry_run,
+                              get_app=iterm2.async_get_app, failure=failure), retry=False)
+        reason = "iTerm2 connection ended"
+    except (Exception, SystemExit) as exc:  # the iterm2 package sys.exit()s on errors
+        if isinstance(exc, SystemExit):
+            reason = "iTerm2 connection lost (library exit %s)" % exc.code
+        else:
+            reason = "iTerm2 connection lost: %s: %s" % (type(exc).__name__, exc)
+        if failure.get("error"):
+            reason += ": %s" % failure["error"]
+    log.warning("%s; exiting so launchd starts a clean process", reason)
+    record_meta(conn, last_error=reason[:500], last_exit_at=time.time(), liveness=time.time())
+    return 1
 
 
 if __name__ == "__main__":

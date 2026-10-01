@@ -108,7 +108,7 @@ cc-sessions hibernate <sid>|--all-idle   ask the daemon (explicit: skips pressur
 cc-sessions wake <sid>|--all         resume in the original tab, or a new tab if it is gone
 cc-sessions pending <transcript>     {"pending": [...], "last_text": "..."}; unreadable = pending
 cc-sessions holds <path> [-v]        exit 0 held, 1 free, 2 ledger unreadable (treat != 1 as held)
-cc-sessions restore [--auto] [--dry-run] [--limit N] [--include-hibernated]
+cc-sessions restore [--auto] [--dry-run] [--limit N] [--include-hibernated] [--max-age-days N]
 cc-sessions import-legacy [--manifests DIR] [--registry DIR]
 cc-sessions doctor                   PASS/FAIL checks, exit 1 on any FAIL
 cc-sessions reap [--dry-run]         delete dead-pid sockets; list (never kill) orphans
@@ -124,6 +124,10 @@ loss), plus the shutdown cluster: sessions that ended with reason `other` togeth
 before boot. A deliberate exit is never restored. `--auto` (for a login launchd job) runs at
 most once per boot, only for sessions last active before boot, and also retypes (without
 running) the resume command for hibernated sessions whose tab no longer exists.
+`--max-age-days N` overrides `restore_max_age_days` (7; 0 = no limit). `--auto` never looks
+back less than 30 days, and only an explicit `--max-age-days 0` lifts that floor. With
+`--include-hibernated` (not `--auto`), a hibernated session whose worktree is gone but whose
+git repo remains is still typed: cc-resume rebuilds the worktree.
 
 ### holds
 
@@ -135,7 +139,7 @@ For a worktree sweeper: a session holds `W` when its cwd (or launch cwd) is `W` 
 ## Configuration
 
 `~/.config/cc-sessions/config.json`, every key optional (`CC_SESSIONS_CONFIG` overrides the
-path, `CC_SESSIONS_DB` the ledger). A config file that does not parse forces `dry_run` on.
+path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file that does not parse forces `dry_run` on.
 
 | key | default | |
 |---|---|---|

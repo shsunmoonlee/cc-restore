@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.join(REPO, "lib"))
 _SAFE = tempfile.mkdtemp(prefix="ccs-test-")
 os.environ["CC_SESSIONS_DB"] = os.path.join(_SAFE, "never.db")
 os.environ["CC_SESSIONS_CONFIG"] = os.path.join(_SAFE, "never.json")
+os.environ["CC_SESSIONS_LOG"] = os.path.join(_SAFE, "never.log")
+REAL_LOG = os.path.expanduser("~/Library/Logs/cc-sessions.log")
 
 from ccsessions import config, ledger  # noqa: E402
 
@@ -66,9 +68,10 @@ class TempEnv(unittest.TestCase):
         self.cfg_path = os.path.join(self.tmp, "config.json")
         with open(self.cfg_path, "w") as fh:
             json.dump(cfgd, fh)
-        self._env = {k: os.environ.get(k) for k in ("CC_SESSIONS_DB", "CC_SESSIONS_CONFIG")}
+        self._env = {k: os.environ.get(k) for k in ("CC_SESSIONS_DB", "CC_SESSIONS_CONFIG", "CC_SESSIONS_LOG")}
         os.environ["CC_SESSIONS_CONFIG"] = self.cfg_path
         os.environ["CC_SESSIONS_DB"] = self.db
+        os.environ["CC_SESSIONS_LOG"] = cfgd["log"]
         self.addCleanup(self._restore_env)
         self.cfg = config.load()
         self.conn = ledger.connect(self.db)
