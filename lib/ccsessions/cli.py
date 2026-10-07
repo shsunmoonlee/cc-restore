@@ -196,9 +196,8 @@ def _request(cfg, kind, sid):
             print("unknown session %s" % sid, file=sys.stderr)
             return 1
     rid = ledger.add_request(conn, kind, sid)
-    hb = ledger.get_meta(conn, "heartbeat")
     print("queued %s request #%d%s" % (kind, rid, " for " + sid[:8] if sid else ""))
-    if not hb or time.time() - float(hb) > 120:
+    if daemon_freshness(conn)[0] == "stale":
         print("warning: the daemon heartbeat is stale; nothing will act on this until it runs",
               file=sys.stderr)
     return 0
@@ -280,6 +279,25 @@ def _meta_float(conn, key):
         return None
 
 
+def daemon_freshness(conn, now=None):
+    """-> (verdict, heartbeat_age_s, pass_started_at, liveness_age_s). verdict: "fresh" (a
+    tick completed within DAEMON_FRESH_S), "busy" (no recent tick, but an eviction pass is
+    in progress and liveness, written with pass_started_at and after each eviction, is
+    that fresh and no older than the pass start), else "stale"."""
+    now = time.time() if now is None else now
+    hb, lv = _meta_float(conn, "heartbeat"), _meta_float(conn, "liveness")
+    started = _meta_float(conn, "pass_started_at")
+    hb_age = now - hb if hb is not None else None
+    lv_age = now - lv if lv is not None else None
+    if hb_age is not None and hb_age < DAEMON_FRESH_S:
+        verdict = "fresh"
+    elif started is not None and lv is not None and lv >= started and lv_age < DAEMON_FRESH_S:
+        verdict = "busy"
+    else:
+        verdict = "stale"
+    return verdict, hb_age, started, lv_age
+
+
 def _pid_running(conn, alive):
     from . import ledger
     pid = ledger.get_meta(conn, "pid")
@@ -292,8 +310,10 @@ def _pid_running(conn, alive):
 
 def daemon_checks(conn, now=None, alive=None):
     """[(status, name, detail)] from the daemon's meta rows. `heartbeat` = last completed
-    tick; `liveness` = the daemon process is running (written at startup and on every
-    connect attempt); `connected_at` = last good iTerm2 connect (which clears `last_error`);
+    tick; `liveness` = the daemon process is running (written at startup, on every
+    connect attempt and after each eviction); `pass_started_at` = an eviction pass is in
+    progress (a stale heartbeat then reads as busy while liveness is fresh and the pid
+    runs); `connected_at` = last good iTerm2 connect (which clears `last_error`);
     `last_error` / `last_exit_at` = why and when it last gave up."""
     from . import ledger, procs
     now = time.time() if now is None else now
@@ -314,8 +334,12 @@ def daemon_checks(conn, now=None, alive=None):
     else:
         since = max([t for t in (hb, exit_at) if t is not None] or starts[-1:] or [lv or now])
         link = "disconnected since %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
-    if hb_age is not None and hb_age < DAEMON_FRESH_S:
+    verdict, _, started, lv_age = daemon_freshness(conn, now)
+    if verdict == "fresh":
         out.append(("PASS", "daemon heartbeat", "%ds ago" % hb_age))
+    elif verdict == "busy" and _pid_running(conn, alive)[1]:
+        out.append(("PASS", "daemon heartbeat", "daemon busy: evicting since %s (liveness %ds ago, "
+                    "last tick %s)" % (time.strftime("%H:%M:%S", time.localtime(started)), lv_age, tick)))
     elif lv is not None and now - lv < DAEMON_FRESH_S:
         pid, running = _pid_running(conn, alive)
         out.append(("FAIL", "daemon heartbeat", "daemon pid %s %s, last tick %s, %s: %s" % (

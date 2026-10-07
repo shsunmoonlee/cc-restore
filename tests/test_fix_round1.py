@@ -431,9 +431,8 @@ class Fix11To16Daemon(TempEnv):
         async def pick(free, rows=None, explicit=False, exclude=()):
             excluded_seen.append(set(exclude))
             sid, out = next(script)
-            d.last_pick = sid
-            return out
-        d.pick_and_evict = pick
+            return out, sid
+        d.pick = pick
         res = arun(d.do_request({"kind": "hibernate-all-idle", "session_id": None}))
         self.assertEqual(res, "evicted 1")
         self.assertEqual(excluded_seen, [set(), {"A"}, {"A"}])

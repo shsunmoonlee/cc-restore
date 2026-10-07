@@ -95,6 +95,18 @@ def heal_transcript(conn, sid, old, new):
         return 0
 
 
+def heal_title(conn, sid, old, new):
+    """Best effort: record the transcript's title, unless the column changed meanwhile.
+    -> rows updated (0 on any SQLite error)."""
+    try:
+        with tx(conn):
+            cur = conn.execute("UPDATE sessions SET title=? WHERE session_id=? AND title IS ?",
+                               (new, sid, old))
+            return cur.rowcount
+    except sqlite3.Error:
+        return 0
+
+
 def connect(path, readonly=False):
     if readonly:
         if not os.path.exists(path):
@@ -434,16 +446,20 @@ def set_focus(conn, sid, guid, now=None):
 
 def stamp_visible(conn, tty_guid, now=None):
     """last_focus_at = now for every live row whose tty is shown right now (all panes of
-    each window's current tab), so it records the last time a session was SEEN."""
+    each window's current tab), so it records the last time a session was SEEN. Evicting
+    rows too: the daemon's last check before SIGTERM aborts when last_focus_at moved. An
+    evicting row keeps its iterm_guid: a tty reused by another pane mid-eviction must not
+    rebind the row to that pane's tab."""
     now = time.time() if now is None else now
     if not tty_guid:
         return 0
     n = 0
     with tx(conn):
         for tty, guid in tty_guid.items():
-            cur = conn.execute("UPDATE sessions SET last_focus_at=?, iterm_guid=? WHERE tty=? AND "
-                               "ended_at IS NULL AND state IN (?,?,?)",
-                               (now, guid, tty, BUSY, IDLE, WAITING))
+            cur = conn.execute("UPDATE sessions SET last_focus_at=?, iterm_guid=CASE WHEN "
+                               "state=? THEN iterm_guid ELSE ? END WHERE tty=? AND "
+                               "ended_at IS NULL AND state IN (?,?,?,?)",
+                               (now, EVICTING, guid, tty, BUSY, IDLE, WAITING, EVICTING))
             n += cur.rowcount
     return n
 

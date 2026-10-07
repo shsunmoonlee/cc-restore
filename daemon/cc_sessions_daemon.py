@@ -16,6 +16,8 @@ first (compare-and-set to 'evicting'), then SIGTERM, then SIGKILL after term_gra
 Focusing a hibernated tab types the resume command into it.
 """
 import asyncio
+import collections
+import contextlib
 import fcntl
 import functools
 import glob
@@ -27,6 +29,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -60,6 +63,7 @@ APP_CONNECT_TIMEOUT_S = ITERM_CALL_TIMEOUT_S * 3
 CANCEL_WAIT_S = 5
 OUT_LOG_CAP = 5 * 1024 * 1024
 RECENT_STARTS = 10
+TITLE_CACHE_MAX = 256
 TTY_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
              "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[<u\x1b[?7h\x1b[0m\x1b>")
 
@@ -68,6 +72,11 @@ TTY_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l
 
 def _mins(s):
     return int(max(0, s) / 60)
+
+
+def _pct(v):
+    """A percentage for the log; "?" when it could not be read."""
+    return "?" if v is None else "%s%%" % v
 
 
 def _as_analysis(v):
@@ -109,6 +118,62 @@ def heal_transcripts(conn, rows, before):
             log.info("transcript of %s resolved to %s (recorded %s)", sid[:8], r["transcript"],
                      before[sid])
     return healed
+
+
+def heal_titles(conn, rows, before):
+    """Write back the transcript titles title_for put in `rows` (before: {sid: the
+    recorded title}), compare-and-set on the old value. Best effort, skipped inside a
+    transaction. -> [(sid, old, new)]."""
+    healed = []
+    if conn.in_transaction:
+        return healed
+    for r in rows:
+        sid = r["session_id"]
+        if sid not in before or r.get("title") == before[sid] or not r.get("title"):
+            continue
+        if ledger.heal_title(conn, sid, before[sid], r["title"]):
+            healed.append((sid, before[sid], r["title"]))
+            log.info("title of %s is %r (recorded %r)", sid[:8], r["title"], before[sid])
+    return healed
+
+
+class TitleCache(object):
+    """pending.transcript_title per transcript path, rescanned only when the file's
+    (size, mtime) changes; at most `cap` paths, least recently used dropped first.
+    Thread safe: the policy pass reads it in an executor thread."""
+
+    def __init__(self, cap=TITLE_CACHE_MAX):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.items = collections.OrderedDict()
+
+    def get(self, path):
+        if not path:
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        sig = (st.st_size, st.st_mtime_ns)
+        with self.lock:
+            hit = self.items.get(path)
+            if hit is not None and hit[0] == sig:
+                self.items.move_to_end(path)
+                return hit[1]
+        try:
+            title = pending.transcript_title(path)
+        except OSError:
+            return None
+        with self.lock:
+            self.items[path] = (sig, title)
+            self.items.move_to_end(path)
+            while len(self.items) > self.cap:
+                self.items.popitem(last=False)
+        return title
+
+
+TITLES = TitleCache()
+TITLE_ERRORS = set()  # transcript paths whose title read raised, so each is logged once
 
 
 def guard_reason(row, now, cfg, focus_state, pending_fn, children_fn, identity_fn=None,
@@ -379,7 +444,8 @@ def compute_policy(cfg, focus_state, rows, evictions_today, explicit=False, now=
         identity_fn=default_identity(cfg), activity_fn=default_activity(cfg),
         evictions_today=evictions_today, hook_failed=hook_failed_sids(cfg), explicit=explicit,
         status_fn=default_status(cfg))
-    titles = {r["session_id"]: title_for(r, facts) for r in cands}
+    # only the first candidate is named this pass; the rest heal when they come first
+    titles = {cands[0]["session_id"]: title_for(cands[0], facts)} if cands else {}
     return cands, kept, rss, titles
 
 
@@ -391,16 +457,37 @@ def policy_pass(conn, cfg, focus_state, rows=None, explicit=False, now=None):
     now = time.time() if now is None else now
     rows = live_rows(conn) if rows is None else rows
     before = {r["session_id"]: r.get("transcript") for r in rows}
+    before_titles = {r["session_id"]: r.get("title") for r in rows}
     out = compute_policy(cfg, focus_state, rows, ledger.evictions_today(conn, now), explicit, now)
     heal_transcripts(conn, rows, before)
+    heal_titles(conn, rows, before_titles)
     return out
 
 
 def title_for(row, facts=None):
-    t = row.get("title")
-    if not t and facts is not None:
-        t = facts.analysis(row).get("title")
-    return t or os.path.basename(row.get("cwd") or "") or row["session_id"][:8]
+    """custom-title > ai-title (whole transcript, row["transcript"]) > the ledger title >
+    basename(cwd) > sid[:8]. A transcript title that differs from row["title"] replaces it
+    in this dict; the event loop writes it back (heal_titles). Reads files: off the loop.
+    A transcript whose title read raises counts as having none (logged once per path)."""
+    path = row.get("transcript")
+    try:
+        t = TITLES.get(path)
+    except Exception:
+        t = None
+        if path not in TITLE_ERRORS:
+            if len(TITLE_ERRORS) >= TITLE_CACHE_MAX:
+                TITLE_ERRORS.clear()
+            TITLE_ERRORS.add(path)
+            log.exception("title of %s unreadable: %s", row["session_id"][:8], path)
+    if t and t != row.get("title"):
+        row["title"] = t
+    return t or row.get("title") or os.path.basename(row.get("cwd") or "") or row["session_id"][:8]
+
+
+def resolve_title(row, cfg):
+    """title_for after resolving the row's transcript (row_transcript)."""
+    row_transcript(row, cfg)
+    return title_for(row)
 
 
 # ------------------------------------------------------------------ eviction sequence
@@ -531,8 +618,8 @@ class Evictor(object):
         st = ledger.state_of(self.conn, sid)
         ledger.finish_eviction(self.conn, eid, outcome, signal=sig,
                                detail=None if st == HIBERNATED else "row ended as %s" % st)
-        log.info("evicted %s (%s)%s free=%s%% rss=%.0fMB", sid[:8], outcome,
-                 " reason=%s" % reason if reason else "", free, rss_mb or 0)
+        log.info("evicted %s (%s)%s free=%s rss=%.0fMB", sid[:8], outcome,
+                 " reason=%s" % reason if reason else "", _pct(free), rss_mb or 0)
         title = title or row.get("title") or sid[:8]
         lost = None
         if st == HIBERNATED:
@@ -549,13 +636,17 @@ class Evictor(object):
         return outcome
 
     def final_check(self, row):
-        """Re-read the row and the registry immediately before SIGTERM."""
+        """Re-read the row and the registry immediately before SIGTERM. A focus or
+        visibility stamp only writes last_focus_at, so it is compared too: a row whose
+        last_focus_at moved after the guards read it was seen in the meantime."""
         sid = row["session_id"]
         fresh = ledger.get(self.conn, sid)
         if not fresh or fresh.get("state") != EVICTING:
             return "row is %s before signal" % (fresh or {}).get("state")
         if fresh.get("last_event_at") != row.get("last_event_at"):
             return "hook activity during the checks"
+        if fresh.get("last_focus_at") != row.get("last_focus_at"):
+            return "focused during the checks"
         if fresh.get("pid") != row.get("pid") or fresh.get("pid_start") != row.get("pid_start"):
             return "row identity changed"
         d = read_registry(self.cfg.path("claude_sessions"), row["pid"])
@@ -654,7 +745,8 @@ class Pressure(object):
     """Hysteresis + global backoff. evict_fn(free) -> outcome or None (no candidate).
     free_fn and swap_fn may be sync or async. Two triggers: free < low_free_pct ("free"),
     else swap used >= swap_high_pct ("swap"). Every pass stops at high_free_pct; a
-    swap-triggered pass also stops once swap is below swap_high_pct - 10."""
+    swap-triggered pass also stops once swap is below swap_high_pct - 10. A pass also
+    stops after max_evictions_per_pass evictions (0 = no cap); the next tick continues."""
 
     SWAP_HYSTERESIS = 10
 
@@ -688,7 +780,8 @@ class Pressure(object):
                      "?" if swap is None else swap, self.cfg.get("swap_high_pct"))
         self.trigger = trigger
         swap_stop = float(self.cfg.get("swap_high_pct") or 0) - self.SWAP_HYSTERESIS
-        misses = 0
+        cap = int(self.cfg.get("max_evictions_per_pass") or 0)
+        misses = done = 0
         while True:
             outcome = await evict_fn(free)
             if outcome is None:
@@ -722,6 +815,11 @@ class Pressure(object):
                 return "relieved"
             if trigger == "swap" and new_swap < swap_stop:
                 return "relieved"
+            done += 1
+            if cap > 0 and done >= cap:
+                log.info("memory pressure: %d evictions this pass (max_evictions_per_pass); "
+                         "continuing next tick", done)
+                return "capped"
             free, swap = new, new_swap
 
 
@@ -949,7 +1047,9 @@ class Daemon(object):
         self.last_fire = {}
         self.last_reap = self.last_prune = 0.0
         self.last_said = None
-        self.last_pick = None
+        self.busy_depth = 0
+        self.pass_marked = False
+        self.idle_disabled_said = False
         self.visible = {}  # tty -> guid shown right now
         self.blind_since = None
         self.last_blind_meta = None
@@ -1024,19 +1124,41 @@ class Daemon(object):
         rows = [r for r in rows if r["session_id"] not in exclude]
         ev = ledger.evictions_today(self.conn, now)
         before = {r["session_id"]: r.get("transcript") for r in rows}
+        before_titles = {r["session_id"]: r.get("title") for r in rows}
         out = await self.off(compute_policy, cfg or self.cfg, focus, rows, ev, explicit, now)
         heal_transcripts(self.conn, rows, before)
+        heal_titles(self.conn, rows, before_titles)
         return out
 
-    async def pick_and_evict(self, free, rows=None, explicit=False, exclude=(), policy_cfg=None,
-                             reason=None):
-        """policy_cfg: the config the guards (and the post-CAS re-check) run with; the idle
+    async def resume_title(self, row):
+        """The tab name for a resumed session: resolve_title off the loop, then the healed
+        transcript path and title written back here."""
+        sid = row["session_id"]
+        before, before_title = {sid: row.get("transcript")}, {sid: row.get("title")}
+        try:
+            title = await self.off(resolve_title, row, self.cfg)
+        except Exception:
+            log.exception("title of %s unreadable", sid[:8])
+            return row.get("title") or sid[:8]
+        heal_transcripts(self.conn, [row], before)
+        heal_titles(self.conn, [row], before_title)
+        return title
+
+    async def pick(self, free, rows=None, explicit=False, exclude=(), policy_cfg=None, reason=None):
+        """-> (outcome, session_id picked). Outcome None = nothing evicted (no candidate, or
+        dry run); the session id is per call, so concurrent picks never mix them up.
+        policy_cfg: the config the guards (and the post-CAS re-check) run with; the idle
         pass swaps idle_min. reason: str, or callable(row) -> str, for the eviction log."""
         async with self.evict_lock:
             return await self._pick_and_evict(free, rows, explicit, exclude, policy_cfg, reason)
 
+    async def pick_and_evict(self, free, rows=None, explicit=False, exclude=(), policy_cfg=None,
+                             reason=None):
+        """pick() without the session id -> outcome."""
+        out, _ = await self.pick(free, rows, explicit, exclude, policy_cfg, reason)
+        return out
+
     async def _pick_and_evict(self, free, rows, explicit, exclude, policy_cfg=None, reason=None):
-        self.last_pick = None
         focus = await self.snapshot()
         self.stamp_visibility(focus)
         cands, kept, rss, titles = await self.policy(focus, rows, explicit, exclude, cfg=policy_cfg)
@@ -1044,21 +1166,20 @@ class Daemon(object):
             said = ("none", tuple(sorted((r["session_id"][:8], w) for r, w in kept)))
             # the idle pass finds nothing on most ticks: only the pressure pass logs keeps
             if policy_cfg is None and said != self.last_said:
-                log.info("free %s%%: no eviction candidate (%s)", free,
+                log.info("free %s: no eviction candidate (%s)", _pct(free),
                          "; ".join("%s %s" % (r["session_id"][:8], w) for r, w in kept[:12]))
                 self.last_said = said
-            return None
+            return None, None
         row = cands[0]
-        self.last_pick = row["session_id"]
         row["iterm_guid_now"] = focus["tty_guid"].get(row["tty"])
         title = titles.get(row["session_id"]) or row["session_id"][:8]
         if self.dry_run:
             said = ("would", row["session_id"])
             if said != self.last_said:
-                log.info("DRY RUN would evict %s %s (free %s%%, %.0f MB)", row["session_id"][:8],
-                         title[:40], free, rss.get(row["session_id"], 0))
+                log.info("DRY RUN would evict %s %s (free %s, %.0f MB)", row["session_id"][:8],
+                         title[:40], _pct(free), rss.get(row["session_id"], 0))
                 self.last_said = said
-            return None
+            return None, row["session_id"]
 
         async def recheck(r):
             # runs AFTER the compare-and-set: the row is ours, re-verify everything
@@ -1079,8 +1200,10 @@ class Daemon(object):
                 self.conn.execute("UPDATE sessions SET iterm_guid=? WHERE session_id=?",
                                   (row["iterm_guid_now"], row["session_id"]))
         why = reason(row) if callable(reason) else reason
-        return await self.evictor.evict(row, free, rss.get(row["session_id"], 0), recheck=recheck,
-                                        title=title, reason=why)
+        self.mark_pass()
+        out = await self.evictor.evict(row, free, rss.get(row["session_id"], 0), recheck=recheck,
+                                       title=title, reason=why)
+        return out, row["session_id"]
 
     async def evict_pass(self, free, rows=None, explicit=False, limit=50, reason=None):
         """Repeated picks that never re-pick a session that aborted in this pass."""
@@ -1088,13 +1211,44 @@ class Daemon(object):
 
         async def one(f):
             kw = {"reason": reason} if reason is not None else {}
-            out = await self.pick_and_evict(f, rows=rows, explicit=explicit, exclude=aborted, **kw)
-            if out is not None and out not in ("term", "killed") and self.last_pick:
-                aborted.add(self.last_pick)
+            out, sid = await self.pick(f, rows=rows, explicit=explicit, exclude=aborted, **kw)
+            if out is not None and out not in ("term", "killed") and sid:
+                aborted.add(sid)
             if out is not None:
                 outcomes.append(out)
+                self.alive()
             return out
         return one, outcomes
+
+    def alive(self):
+        """liveness after each eviction attempt: a long pass delays the heartbeat (written
+        once per completed tick), and doctor must not read that as a hung daemon."""
+        record_meta(self.conn, liveness=time.time())
+
+    def mark_pass(self):
+        """meta pass_started_at (with liveness, same instant) on the first eviction attempt
+        inside busy(), so ticks that evict nothing write no meta."""
+        if self.busy_depth > 0 and not self.pass_marked:
+            now = time.time()
+            record_meta(self.conn, pass_started_at=now, liveness=now)
+            self.pass_marked = True
+
+    @contextlib.contextmanager
+    def busy(self):
+        """An eviction pass is running (the outermost entry starts it). pass_started_at is
+        written lazily by mark_pass and cleared when the last pass ends, only if it was
+        written; record_start clears a value a dead process left. doctor reads a stale
+        heartbeat as busy, not hung, only while liveness is fresh and no older than it."""
+        if self.busy_depth == 0:
+            self.pass_marked = False
+        self.busy_depth += 1
+        try:
+            yield
+        finally:
+            self.busy_depth -= 1
+            if self.busy_depth == 0 and self.pass_marked:
+                record_meta(self.conn, pass_started_at="")
+                self.pass_marked = False
 
     async def tick(self):
         if self.connection is not None and not connection_alive(self.connection):
@@ -1122,14 +1276,15 @@ class Daemon(object):
                 log.info("reaped %d dead sockets", len(removed))
             self.last_reap = now
         free = await self.off(procs.free_pct)
-        if free is None:
-            log.warning("memory_pressure unreadable; not evicting")
-        else:
-            swap = await self.off(procs.swap_pct)
-            async with self.pass_lock:
-                one, _ = await self.evict_pass(free, reason=lambda r: self.pressure.trigger)
-                await self.pressure.relieve(free, one, swap=swap)
-        await self.idle_pass(free)
+        with self.busy():
+            if free is None:
+                log.warning("memory_pressure unreadable; not evicting")
+            else:
+                swap = await self.off(procs.swap_pct)
+                async with self.pass_lock:
+                    one, _ = await self.evict_pass(free, reason=lambda r: self.pressure.trigger)
+                    await self.pressure.relieve(free, one, swap=swap)
+            await self.idle_pass(free)
         self.heartbeat()  # only after a tick that completed
 
     async def idle_pass(self, free):
@@ -1142,6 +1297,11 @@ class Daemon(object):
         if mins <= 0:
             return []
         cap = int(self.cfg.get("idle_hibernate_per_tick") or 0)
+        if cap <= 0:
+            if not self.idle_disabled_said:
+                log.info("idle pass disabled (per_tick %s)", self.cfg.get("idle_hibernate_per_tick"))
+                self.idle_disabled_said = True
+            return []
         pcfg = config.Config(self.cfg)
         pcfg["idle_min"] = mins
         aborted, outcomes, done, misses = set(), [], 0, 0
@@ -1153,16 +1313,17 @@ class Daemon(object):
                 if self.connection is not None and not connection_alive(self.connection):
                     raise ConnectionLost("iTerm2 websocket closed")
                 rows = [r for r in live_rows(self.conn) if r.get("state") == IDLE]
-                out = await self.pick_and_evict(free, rows=rows, exclude=aborted, policy_cfg=pcfg,
-                                                reason=why)
+                out, sid = await self.pick(free, rows=rows, exclude=aborted, policy_cfg=pcfg,
+                                           reason=why)
                 if out is None:
                     break
                 outcomes.append(out)
+                self.alive()
                 if out in ("term", "killed"):
                     done += 1
                     continue
-                if self.last_pick:
-                    aborted.add(self.last_pick)
+                if sid:
+                    aborted.add(sid)
                 misses += 1
                 if misses >= MAX_ABORTS_PER_PASS:
                     break
@@ -1209,9 +1370,10 @@ class Daemon(object):
             return out or "kept (see log)"
         if kind == "hibernate-all-idle":
             one, outcomes = await self.evict_pass(free)
-            for _ in range(50):
-                if await one(free) is None:
-                    break
+            with self.busy():
+                for _ in range(50):
+                    if await one(free) is None:
+                        break
             return "evicted %d" % len([d for d in outcomes if d in ("term", "killed")])
         if kind == "wake":
             row = ledger.get(self.conn, sid)
@@ -1245,7 +1407,7 @@ class Daemon(object):
             ledger.mark_hibernated(self.conn, row["session_id"], only_from=(RESUMING,))
             return "tab is running %s" % job
         await self.tabs.send_text(guid, "\x15" + cmd + "\r")
-        await self.tabs.set_name(guid, row.get("title") or row["session_id"][:8])
+        await self.tabs.set_name(guid, await self.resume_title(row))
         return "resumed"
 
     async def request_loop(self):
@@ -1306,7 +1468,7 @@ class Daemon(object):
         ledger.mark_resuming(self.conn, row["session_id"], now)
         await iterm_call(session.async_send_text(
             "\x15" + resumecmd.command(self.cfg, row["session_id"], row.get("cwd")) + "\r"), "send_text")
-        await iterm_call(session.async_set_name(row.get("title") or row["session_id"][:8]), "set_name")
+        await iterm_call(session.async_set_name(await self.resume_title(row)), "set_name")
         log.info("resumed %s on focus (%s)", row["session_id"][:8], tty)
 
     async def focus_loop(self):
@@ -1420,8 +1582,9 @@ def sleep_alive(conn, total, chunk):
 
 def record_start(conn, now=None):
     """starts += 1, pid, recent_starts (last RECENT_STARTS start times, for doctor's
-    restart-loop warning), liveness. Clears blind_since / skipped_sessions: a value left by
-    an earlier process must not drive doctor's blind-snapshot warning."""
+    restart-loop warning), liveness. Clears blind_since / skipped_sessions / pass_started_at:
+    a value left by an earlier process must not drive doctor's blind-snapshot warning or
+    read as a pass in progress."""
     now = time.time() if now is None else now
     try:
         n = int(ledger.get_meta(conn, "starts") or 0)
@@ -1433,7 +1596,7 @@ def record_start(conn, now=None):
         recent = []
     recent = (recent + [now])[-RECENT_STARTS:]
     record_meta(conn, starts=n + 1, pid=os.getpid(), recent_starts=json.dumps(recent), liveness=now,
-                blind_since="", skipped_sessions=0)
+                blind_since="", skipped_sessions=0, pass_started_at="")
 
 
 async def run_connected(connection, cfg, conn, dry_run, get_app, failure=None):
@@ -1587,7 +1750,8 @@ def main(argv=None):
         if failure.get("error"):
             reason += ": %s" % failure["error"]
     log.warning("%s; exiting so launchd starts a clean process", reason)
-    record_meta(conn, last_error=reason[:500], last_exit_at=time.time(), liveness=time.time())
+    record_meta(conn, last_error=reason[:500], last_exit_at=time.time(), liveness=time.time(),
+                pass_started_at="")
     return 1
 
 

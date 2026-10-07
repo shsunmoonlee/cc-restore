@@ -167,6 +167,7 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 | `idle_hibernate_per_tick` | 3 | most idle-pass evictions per tick |
 | `cooldown_min` | 45 | no eviction this soon after a resume |
 | `max_evictions_per_day` | 3 | per session |
+| `max_evictions_per_pass` | 10 | most evictions one memory-pressure pass makes; the next tick continues (0 = no cap) |
 | `term_grace_s` | 15 | SIGTERM to SIGKILL |
 | `tick_s` | 30 | pressure check interval |
 | `settle_s` / `backoff_min` | 10 / 10 | global backoff when an eviction frees nothing |
