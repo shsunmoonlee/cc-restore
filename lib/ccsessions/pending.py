@@ -109,6 +109,36 @@ def head_has_user(path, nbytes=TAIL_BYTES):
     return False
 
 
+TITLE_MARKS = (b'"custom-title"', b'"ai-title"')
+
+
+def transcript_title(path):
+    """The session title Claude Code recorded in the WHOLE transcript: the last
+    custom-title record, else the last ai-title record, else None. Only lines carrying a
+    title marker are parsed. Raises OSError when unreadable."""
+    custom = ai = None
+    with open(path, "rb") as fh:
+        for raw in fh:
+            if TITLE_MARKS[0] not in raw and TITLE_MARKS[1] not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            typ = d.get("type")
+            if typ == "custom-title":
+                t = d.get("customTitle")
+                if isinstance(t, str) and t.strip():
+                    custom = t.strip()
+            elif typ == "ai-title":
+                t = d.get("aiTitle")
+                if isinstance(t, str) and t.strip():
+                    ai = t.strip()
+    return custom or ai
+
+
 def notified_ids(raw):
     """Task ids a real <task-notification>...</task-notification> envelope finishes: one
     with a <status> (outside its <event>), or whose <event> is a Monitor timeout/expiry.

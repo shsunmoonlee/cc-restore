@@ -23,6 +23,8 @@ DEFAULTS = {
     "idle_min": 10,
     "cooldown_min": 45,
     "max_evictions_per_day": 3,
+    # most evictions one memory-pressure pass makes before the tick ends (0 = no cap)
+    "max_evictions_per_pass": 10,
     "term_grace_s": 15,
     "tick_s": 30,
     # Child processes that do not count as work (MCP servers and their launchers).
